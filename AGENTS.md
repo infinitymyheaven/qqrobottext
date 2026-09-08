@@ -1,72 +1,68 @@
-# AGENTS.md — QQ 群机器人项目速查
-
-> 本文件供后续 AI 代理（Codex 等）快速了解本项目。目标、结构、环境事实如有变化，请同步更新本文。
+# AGENTS.md — QQ 群 DeepSeek 机器人项目速查
 
 ## 1. 项目概述
 
-- 项目：qqrobottext（本地目录 `D:\codex\qqrobot`），极简 QQ 群聊机器人，**Python 版**。
-- 唯一功能：群聊中被 `@机器人本人` 时，回复纯文本 `对不起做不到。`
-- 明确不处理：普通群消息、`@全体成员`、私聊、主动发言、引用/`@` 回。
-- 架构：NapCat（QQ 协议端，登录真实 QQ 并提供 OneBot v11 服务）+ 本项目 Python 客户端（连接 NapCat 正向 WebSocket）。
-- 依赖：仅第三方库 `websockets`；其余为 Python 标准库。要求 Python ≥ 3.10（本机 3.12.14）。
+- 项目：`qqrobottext`，Python QQ 群聊机器人。
+- 功能：群聊中被 `@机器人本人` 时，提取文字、调用 DeepSeek Chat Completions API，并把回复发回群聊。
+- 不处理：普通群消息、`@全体成员`、私聊、主动发言、图片和文件输入。
+- 架构：NapCat（OneBot v11 正向 WebSocket）+ 本项目 Python 客户端 + DeepSeek OpenAI 兼容 API。
+- 依赖：仅 `websockets`；HTTP 请求使用 Python 标准库。Python 要求 3.10 以上。
 
-## 2. 目录结构
+## 2. 目录与运行
 
-- `src/bot.py`：全部机器人逻辑与程序入口（asyncio + websockets）。
-- `tests/test_bot.py`：行为测试（unittest，5 项，全部通过）。
-- `requirements.txt`：`websockets>=12.0`。
-- `.env.example` / `.gitignore`：环境变量示例；`.env` 不存在时走默认值。Python 的 `.venv/`、`__pycache__/` 已忽略。
-- `README.md`：完整中文安装与使用文档（含 NapCat 配置）。
-- `LICENSE`：MIT。
-- `qq/`：NapCat/QQ 本地运行时目录（git 已忽略，不上传）。
-  - `qq/napcat/launcher-fixed.bat`：本机修复版启动器（显式指定 QQ.exe 路径，绕过注册表探测）。
-  - `qq/napcat/config/onebot11_<QQ号>.json`：OneBot 网络配置（QQ 号 3958801964）。
-  - `qq/napcat/config/webui.json`：WebUI 配置与登录 token —— **敏感，勿写入文档或提交**。
-- 说明：原 Node.js 实现（`src/index.js`、`package.json`）已在 Python 重构时删除。
+- `src/bot.py`：全部机器人、DeepSeek HTTP 客户端和入口逻辑。
+- `tests/test_bot.py`：消息解析、API 请求格式、上下文隔离和群聊行为测试。
+- `.env.example`：NapCat 与 DeepSeek 配置示例；真实 `.env` 已忽略。
+- `README.md`：完整中文安装与使用文档。
+- 本机运行：`.venv\Scripts\python.exe src\bot.py`
+- 测试：`.venv\Scripts\python.exe -m unittest discover -s tests -v`
+- Windows 系统 `python` 是商店占位符，本机操作一律使用项目 `.venv` 中的 Python。
+- `.venv` 的基础解释器固定在 `D:\codex\python-runtimes\cpython-3.12.14-windows-x86_64-none\python.exe`，普通 PowerShell 可直接访问。不要改回 Codex 应用隔离的 `AppData\Roaming\uv` 路径。
+- 旧的应用隔离环境临时保留为 `.venv-virtualized-old/` 且已被 Git 忽略；确认无需回退后可删除。
 
-## 3. 运行与配置
+## 3. 配置
 
-- 本机运行（已建好 `.venv`，勿删）：`.venv\Scripts\python.exe src\bot.py`
-- 从零安装：`python -m venv .venv`，再 `.venv\Scripts\python.exe -m pip install -r requirements.txt`。
-- 运行测试：`.venv\Scripts\python.exe -m unittest discover -s tests -v`
-- 环境变量：`NAPCAT_WS_URL` 默认 `ws://127.0.0.1:3001`；`NAPCAT_WS_TOKEN` 默认空（通过 URL `access_token` 参数传递）。
-- 机器人 QQ 号不写进代码：运行时用事件 `self_id` 动态识别。
-- Windows 系统 `python` 仍指向商店占位符（不可用），**一律使用 `.venv\Scripts\python.exe` 完整路径**。
+- `NAPCAT_WS_URL`：默认 `ws://127.0.0.1:3001`。
+- `NAPCAT_WS_TOKEN`：默认空，通过 URL 的 `access_token` 参数传递。
+- `DEEPSEEK_API_KEY`：必填，缺失时程序以状态码 2 退出。
+- `DEEPSEEK_BASE_URL`：默认 `https://api.deepseek.com`。
+- `DEEPSEEK_MODEL`：默认 `deepseek-v4-flash`，可为兼容服务商的模型名。
+- `DEEPSEEK_SYSTEM_PROMPT`、`DEEPSEEK_TIMEOUT_SECONDS`、`DEEPSEEK_MAX_TOKENS` 可调。
+- `CHAT_HISTORY_MESSAGES`：默认 10 条，`0` 关闭上下文。
+- `MAX_REPLY_CHARS`：默认 2000 字符。
 
-## 4. 实现要点（改动前必读）
+任何真实 API Key、NapCat WebUI Token 或 QQ 登录数据都不得写入文档或提交。
 
-- `QQBot.run()`：`websockets.connect` 循环；断开/异常后每 3 秒自动重连，不崩溃。
-- `_read_loop(ws, pending=None)`：读取消息；动作响应按 `echo` 回填 `pending` future；群消息事件 `create_task` 并发处理；连接结束统一处理未决 future。
-- 只处理 `post_type=message` 且 `message_type=group`；忽略 `user_id === self_id`。
-- `is_at_self()`：消息分段数组中 `at.data.qq === self_id`；`qq=all`（@全体）不触发；字符串消息格式回退解析 `raw_message` 中 `[CQ:at,qq=...]`。
-- 回复：`send_group_msg`，参数 `group_id` + `message: '对不起做不到。'`；`_send_action` 超时 10 秒。
+## 4. 实现要点
 
-## 5. 本机环境事实（排查关键）
+- `DeepSeekClient.chat()` 通过 `asyncio.to_thread` 执行标准库 HTTP 请求，避免阻塞 WebSocket 事件循环。
+- 接口使用 Bearer Token，向 `{base_url}/chat/completions` 发送 OpenAI 兼容消息；若 Base URL 已包含完整路径则不重复拼接。
+- `extract_message_text()` 只提取 OneBot 文本段；字符串格式会移除 CQ 码并反转义 HTML 实体。
+- `QQBot._handle_group_message()` 仅接受群聊中对 `self_id` 的 @，忽略自身消息。
+- 对话上下文以 `(group_id, user_id)` 为键隔离，每个会话用异步锁保持连续对话顺序。
+- API 失败时回复固定友好提示，失败请求不会写入历史；回复过长会截断。
+- `QQBot.run()` 断开或异常后每 3 秒自动连接 NapCat。
+- `_read_loop()` 按 `echo` 匹配 OneBot 动作响应，群事件使用独立任务处理。
 
-- QQ 路径：`D:\Program Files\Tencent\QQNT\QQ.exe`，版本 `9.9.19.35184`（偏旧但 NapCat v4.18.19 曾实测可运行；NapCat `qqnt.json` 目标版本 9.9.22-40990）。
-- 该 QQ 无注册表卸载项，NapCat 官方 `launcher*.bat` 会报 `provided QQ path is invalid`；必须使用 `qq/napcat/launcher-fixed.bat`（管理员运行、先彻底退出 QQ）。
-- Python 安装方式：官方安装器在无桌面会话下失败，改用 uv 管理的独立 Python：`C:\Users\qwer1\AppData\Roaming\uv\python\cpython-3.12.14-windows-x86_64-none\python.exe`；uv 本体在 `%LOCALAPPDATA%\Programs\uv\uv.exe`。
-- 当前 NapCat 状态（2026-09-09）：**未运行**，端口 3001/6099 均未监听；需要重新运行 `launcher-fixed.bat` 并完成 QQ 登录后再做端到端验收。
-- 已核实的 OneBot WS 配置（`onebot11_3958801964.json`）：host `127.0.0.1`、port `3001`、`messagePostFormat=array`、token 空、heartbeat 30s。
-- NapCat 日志仅在控制台（`fileLog=false`）；WebUI token 见启动日志或 `config/webui.json`。
-- GitHub 网络需走本机 Clash 代理 `http://127.0.0.1:7890`（仓库已配置 `http.proxy`）。
+## 5. 本机环境事实
 
-## 6. 进度与待办
+- QQ：`D:\Program Files\Tencent\QQNT\QQ.exe`，版本 `9.9.19.35184`。
+- NapCat：本地目录 `qq/` 已被 Git 忽略；官方启动器无法探测 QQ，需管理员运行 `qq/napcat/launcher-fixed.bat`。
+- OneBot 配置：`127.0.0.1:3001`、数组消息格式、Token 空、心跳 30 秒。
+- 2026-09-09 重新验证时 NapCat 已能在 `127.0.0.1:3001` 接受连接；真实端到端测试时仍需保持其控制台进程运行。
+- `qq/napcat/config/webui.json` 含敏感 Token，不得读取后输出或提交。
+- GitHub 远端：`https://github.com/infinitymyheaven/qqrobottext`，公开仓库，分支 `main`。
+- GitHub 网络使用仓库既有代理配置。
 
-- 已完成：Node → Python 重构；5 项 unittest 全部通过；语法与集成行为验证通过。
-- 待办：启动 NapCat 后做真实端到端验收（`@机器人` 回复、普通消息/`@全体`/自身消息不回复）。
-- 长期注意：QQ 升级后 NapCat 需同步升级；用真实 QQ 登录存在风控/封号风险，建议小号。
+## 6. 当前进度与待办
 
-## 7. 版本控制与开源状态
+- 已完成：Node.js 到 Python 重构；DeepSeek API 聊天接入；按群成员隔离的有限上下文；8 项模拟 API/行为测试；配置与 README；本地 `.env` 已由用户填写且保持忽略状态；新 `.venv` 已成功启动并连接 NapCat。
+- 待办：在真实 QQ 群完成端到端聊天验收。
+- 端到端检查：@机器人能回答；连续追问能读取上下文；普通消息、@全体、私聊和自身消息不回复；错误密钥能返回友好提示。
 
-- 本机 git 仓库分支 `main`，远端 `origin`：<https://github.com/infinitymyheaven/qqrobottext>（公开）。
-- 提交作者：`infinitymyheaven` + GitHub noreply 邮箱；凭据由 GitHub CLI（`C:\Program Files\GitHub CLI\gh.exe`）管理。
-- Python 重构（Node.js → Python）已提交并推送；此后新改动按 `git add -A` → `git commit` → `git push` 同步。
-- `.gitignore` 忽略 `qq/`、`.venv/` 等；NapCat 不随仓库分发；自研代码 MIT。
+## 7. 安全与版本控制
 
-## 8. 参考
-
-- `README.md`：面向用户的中文使用说明。
-- NapCat 官方文档：<https://napneko.github.io/>；发布页：<https://github.com/NapNeko/NapCatQQ/releases>
-- `websockets` 文档：<https://websockets.readthedocs.io/>
-- 对接方式参考项目：Miaoge-Ge/qq-llm-bot、kuliantnt/qq-maid-bot、MoXueYao/QQBot。
+- `.env`、`qq/`、`.venv/` 均已忽略；提交前仍需检查密钥未进入 diff。
+- 使用普通 QQ 登录存在风控和封号风险，建议小号。
+- DeepSeek API 会产生用量和费用，测试时注意账户余额与请求频率。
+- 新改动验证后再按用户明确要求提交和推送，不自动扩大远端写入范围。

@@ -1,125 +1,122 @@
-# QQ 群聊机器人（Python 版）
+# QQ 群聊 DeepSeek 机器人（Python 版）
 
-一个极简的 QQ 群聊机器人：当群成员在群里 `@机器人` 时，机器人发送一条纯文本消息 `对不起做不到。`。
+当群成员在 QQ 群里 `@机器人` 并输入问题时，机器人会把纯文本问题交给 DeepSeek，并将模型回复发回群聊。
 
-架构上由两部分组成：
+## 工作方式
 
-- **NapCat**：QQ 协议端。负责登录一个普通 QQ 账号，并以 OneBot v11 正向 WebSocket 服务的形式提供消息收发能力。
-- **本项目**：Python 客户端（`src/bot.py`）。连接 NapCat 的 WebSocket，监听群消息事件，检测到被 `@` 后调用 `send_group_msg` 发送回复。
+- NapCat 登录机器人 QQ，并提供 OneBot v11 正向 WebSocket 服务。
+- 本项目连接 NapCat，只监听群聊中对机器人本人的 `@`。
+- 程序调用 DeepSeek 的 OpenAI 兼容 `chat/completions` API，再通过 `send_group_msg` 回复。
+- 对话历史按“群号 + 用户 QQ”隔离，默认保存最近 10 条消息；程序重启后清空。
+- 普通群消息、`@全体成员`、私聊和机器人自身消息均不响应。
+- 目前只把文字交给模型，图片、文件、表情等非文本消息段会被忽略。
 
-本项目仅依赖第三方库 `websockets`（其余均为 Python 标准库），机器人 QQ 号不需要写进配置——运行时自动从事件中的 `self_id` 获取。
-
-## 项目结构
-
-```text
-qqrobot/
-├── src/bot.py         # 全部机器人逻辑（入口）
-├── tests/test_bot.py  # 行为测试（unittest）
-├── requirements.txt   # Python 依赖
-├── .env.example       # 环境变量示例
-├── .gitignore
-└── README.md
-```
+项目仅依赖 `websockets`，DeepSeek 请求使用 Python 标准库发送，无需安装 OpenAI SDK。
 
 ## 环境要求
 
-- Windows / macOS / Linux（与 NapCat 同机运行）
-- Python ≥ 3.10（开发环境为 3.12）
-- 一个用于登录 NapCat 的普通 QQ 账号
-- 一个用于测试的 QQ 群
+- Python 3.10 或更高版本
+- 已安装并登录的 NapCat
+- 一个 DeepSeek API Key
+- 用于测试的 QQ 小号和 QQ 群
 
-> ⚠️ 风险提示：NapCat 通过普通 QQ 登录，属于非官方协议实现，账号存在被腾讯风控、限制甚至封禁的风险。建议使用不重要的 QQ 小号，并自行评估是否接受该风险。
+> NapCat 属于非官方 QQ 协议实现，账号可能遭遇风控或封禁。建议只使用不重要的小号。
 
-## 第一步：安装并配置 NapCat
+## 1. 配置 NapCat
 
-NapCat 的安装方式与依赖版本会持续更新，最新步骤请以官方文档为准：<https://napneko.github.io/guide/boot/Shell>。Windows x64 从零开始推荐“一键包”路线：
+参照 [NapCat 官方文档](https://napneko.github.io/guide/boot/Shell)完成安装和 QQ 登录，然后在 WebUI 的“网络配置”中新建并启用 OneBot v11 WebSocket 服务器：
 
-1. 前往 NapCat 的 GitHub Releases 页面（<https://github.com/NapNeko/NapCatQQ/releases>），下载最新版本的 `NapCat.Shell.Windows.OneKey.zip`（内置 QQ 与 NapCat，无需先安装 QQ）。
-2. 解压到不含中文与空格的路径（例如 `D:\NapCat`），双击其中的 `NapCatInstaller.exe`，等待自动化配置完成。
-3. 进入自动生成的 `NapCat.XXXX.Shell` 目录，双击 `napcat.bat` 启动。启动后会出现一个控制台窗口，**不要关闭它**。
-4. 从 NapCat 控制台日志中找到形如 `WebUi User Panel Url: http://127.0.0.1:6099/webui?token=xxxxx` 的地址，复制到浏览器打开。
-5. 在 WebUI 内先进入「QQ 登录」并点击 `QRCode`，用**机器人 QQ 账号**的手机 QQ 扫码登录。登录成功后 WebUI Token 会刷新，请再从 NapCat 控制台（或手机 QQ 收到的消息）获取最新带 token 的地址并重新进入。
-6. 重新进入 WebUI 后，按要求设置一个 WebUI 管理密码（不设置会禁用大部分功能）。
-7. 进入「网络配置」，点击「新建」，创建一个 **WebSocket 服务器（正向 WS / OneBot v11）**：
-   - 端口：`3001`
-   - 监听主机：`127.0.0.1`（仅本机使用，更安全；公网部署请勿绑定 `0.0.0.0`）
-   - 消息上报格式 `messagePostFormat`：`array`
-   - Access Token：留空；若设置，则同步填写到本项目的 `.env`
-   - 勾选「保存时启用」，然后保存。
-8. 将机器人 QQ 拉入你的测试群。
+- 主机：`127.0.0.1`
+- 端口：`3001`
+- 消息上报格式：`array`
+- Access Token：可留空；如果填写，必须与 `.env` 中的值一致
 
-> 备选：手动路线为先安装新版 PC 版 QQ（QQNT），再下载 `NapCat.Shell.Windows.Node.zip` 或 `NapCat.Shell.zip`，解压后运行 `launcher.bat`（Win10 用 `launcher-win10.bat`），WebUI 的后续配置步骤相同。
+将机器人 QQ 拉入测试群。Windows 本机已配置过 NapCat 时，可按 `AGENTS.md` 中记录的本机启动说明运行。
 
-## 第二步：安装本项目依赖
-
-在项目根目录打开终端，创建虚拟环境并安装依赖：
+## 2. 安装项目
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-macOS / Linux 将第二行换成 `.venv/bin/python -m pip install -r requirements.txt`。
+macOS / Linux 使用 `.venv/bin/python`。
 
-> Windows PowerShell 可能禁止运行 `.ps1` 激活脚本，因此无需执行 activate，直接用 `.venv\Scripts\python.exe` 即可。
+## 3. 填写 DeepSeek API Key
 
-## 第三步：启动机器人
+打开项目根目录中新建的 `.env`，至少填写：
+
+```dotenv
+DEEPSEEK_API_KEY=你的真实API密钥
+```
+
+`.env` 已被 Git 忽略，不会正常提交到仓库。不要把真实密钥写入代码、聊天截图或公开日志。
+
+默认使用 DeepSeek 官方接口和当前快速模型：
+
+```dotenv
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
+```
+
+如果你的现成 API 来自兼容服务商，请按服务商说明修改这两个值。`DEEPSEEK_BASE_URL` 可以填写 API 根地址，也可以直接填写以 `/chat/completions` 结尾的完整地址。
+
+## 4. 启动并聊天
+
+先启动 NapCat，再在项目根目录运行：
 
 ```powershell
 .venv\Scripts\python.exe src\bot.py
 ```
 
-看到类似 `已连接 NapCat OneBot WebSocket。` 的日志即表示连接成功。然后：
+看到“已连接 NapCat OneBot WebSocket”后，在群里发送：
 
-1. 在测试群里 `@机器人`，机器人会回复：`对不起做不到。`
-2. 如修改了端口或设置了 Access Token，先复制环境变量示例再修改：
+```text
+@机器人 你好，请介绍一下你自己
+```
 
-   ```powershell
-   Copy-Item .env.example .env
-   ```
+机器人会把 DeepSeek 的回答发回群聊。只发送 `@机器人` 而没有文字时，它会提示你输入内容。
 
-## 环境变量
+## 配置项
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `NAPCAT_WS_URL` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 服务地址 |
-| `NAPCAT_WS_TOKEN` | 空 | NapCat WebSocket 服务器设置的 Access Token；未设置则留空 |
+| `NAPCAT_WS_URL` | `ws://127.0.0.1:3001` | NapCat 正向 WebSocket 地址 |
+| `NAPCAT_WS_TOKEN` | 空 | NapCat Access Token |
+| `DEEPSEEK_API_KEY` | 无 | DeepSeek API Key，必填 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 根地址或完整聊天接口地址 |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 模型名称 |
+| `DEEPSEEK_SYSTEM_PROMPT` | 中文群聊助手提示词 | 机器人角色设定 |
+| `DEEPSEEK_TIMEOUT_SECONDS` | `60` | 单次模型请求超时秒数 |
+| `DEEPSEEK_MAX_TOKENS` | `1024` | 模型单次最大输出 token 数 |
+| `CHAT_HISTORY_MESSAGES` | `10` | 每位群成员保留的历史消息条数；`0` 表示关闭上下文 |
+| `MAX_REPLY_CHARS` | `2000` | 发回 QQ 的最大字符数，超出时截断 |
 
-## 运行测试
+## 测试
 
 ```powershell
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-覆盖：`@本人` 回复一次且内容正确、普通消息/私聊/自身消息/`@全体成员` 均不回复、字符串 CQ 码兜底解析。
-
-## 行为边界
-
-- 只响应群聊中 `@机器人本人` 的消息。
-- `@全体成员`（`qq=all`）不会触发回复。
-- 不 `@` 回提问者、不引用原消息，回复为纯文本。
-- 机器人不会主动发言，也不处理私聊、加群申请等其他事件。
-- 断线后每 3 秒自动重连，不崩溃。
+测试使用模拟 DeepSeek 响应，不会消耗 API 额度，也不要求 NapCat 正在运行。
 
 ## 常见问题
 
-- **一直提示“正在连接”/连接失败**：NapCat 未运行、WebSocket 服务器未开启、端口被改过，或 `.env` 中的 `NAPCAT_WS_URL` 与 NapCat 配置不一致。请检查 WebUI 网络配置与监听地址。
-- **提示 `python` 不是有效命令**：Windows 若只装有 Microsoft Store 的 Python 占位符，请改用项目内 `.venv\Scripts\python.exe` 的完整路径运行。
-- **连接后收不到消息**：确认 WebSocket 服务器的消息格式为 `array`；确认机器人确实在该群内。
-- **设置了 Access Token 后连不上**：确认 `.env` 中 `NAPCAT_WS_TOKEN` 与 NapCat 中设置完全一致，或先取消 Access Token 排障。
-- **@ 了不回复**：请确认 @ 的是机器人本人，而不是别人或 @全体。
+- **启动时提示缺少 `DEEPSEEK_API_KEY`**：确认已经把 `.env.example` 复制为 `.env`，并填写了真实密钥。
+- **机器人回复“AI 服务暂时不可用”**：查看程序控制台中的 HTTP 状态码；重点检查密钥、余额、模型名和接口地址。
+- **连接不上 NapCat**：确认 NapCat 已运行、WebSocket 配置已启用，端口和 Token 与 `.env` 一致。
+- **@ 后不回复**：确认 @ 的是机器人本人而不是 `@全体成员`，并确认 NapCat 的消息格式为 `array`。
+- **上下文没有保留**：历史仅保存在内存中，按群和用户隔离，程序重启后会清空。
 
-## 开源许可与免责声明
+## 参考
 
-- 本仓库仅包含本项目自研代码与文档，采用 [MIT License](LICENSE)。
-- NapCat 是独立的第三方项目，采用其自有许可证（Limited Redistribution License：非商业用途、再分发需附完整许可证与来源说明、修改版不得公开发布）。因此**本仓库不附带、不重新分发 NapCat**，请按上文指引从 NapCat 官方 Releases 自行下载。
-- 本项目通过非官方协议接入 QQ（登录普通 QQ 账号），违反腾讯《QQ 软件许可及服务协议》中关于禁止使用非官方客户端的条款，账号存在被风控、限制甚至封禁的风险。本项目仅供学习与测试，请使用不重要的 QQ 小号，风险自负。
+- [DeepSeek API 首次调用](https://api-docs.deepseek.com/)
+- [DeepSeek 多轮对话](https://api-docs.deepseek.com/guides/multi_round_chat)
+- [NapNeko/NapCatQQ](https://github.com/NapNeko/NapCatQQ)
+- [minecraft-dzy/napcat-ai-tools](https://github.com/minecraft-dzy/napcat-ai-tools)
+- [WvvDongmo/QQbot-for-personal-use](https://github.com/WvvDongmo/QQbot-for-personal-use)
 
-## 参考项目与文档
+## 许可证
 
-本项目参考了以下开源项目验证过的对接方式（OneBot v11 事件/动作格式、默认 WS 端口与断线重连模式），并按“仅 @ 回复”的最小需求自建：
-
-- [NapNeko/NapCatQQ](https://github.com/NapNeko/NapCatQQ)：QQ 协议端本体
-- [Miaoge-Ge/qq-llm-bot](https://github.com/Miaoge-Ge/qq-llm-bot)：基于 NapCat（OneBot）的客户端实现参考
-- [kuliantnt/qq-maid-bot](https://github.com/kuliantnt/qq-maid-bot)：NapCat OneBot v11 接入文档参考
-- [MoXueYao/QQBot](https://github.com/MoXueYao/QQBot)：NapCat 安装与配置步骤参考
+自研代码采用 [MIT License](LICENSE)。NapCat 不随本仓库分发，并适用其自身许可证与使用风险。

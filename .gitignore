@@ -8,6 +8,7 @@ qq/
 __pycache__/
 *.pyc
 .venv/
+.venv-virtualized-old/
 
 # 临时文件
 *.tmp
