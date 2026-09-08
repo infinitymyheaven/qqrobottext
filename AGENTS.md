@@ -20,7 +20,7 @@
   - `qq/napcat/launcher-fixed.bat`：本机修复版启动器（显式指定 QQ.exe 路径，绕过注册表探测）。
   - `qq/napcat/config/onebot11_<QQ号>.json`：OneBot 网络配置（当前 QQ 号 3958801964）。
   - `qq/napcat/config/webui.json`：WebUI 配置与登录 token —— **敏感，勿写入文档或提交**。
-- 项目尚未 `git init`；`qq/napcat` 体积大，若日后纳入版本控制需另行决策。
+- `LICENSE`：本仓库自研代码的 MIT 许可证。
 
 ## 3. 运行与配置
 
@@ -52,7 +52,15 @@
 - 待办：在真实测试群中做端到端验收（`@机器人` 回复、普通消息/`@全体`/自身消息不回复）；确认 QQ 账号登录、群邀请等均就绪。
 - 长期注意：QQ 客户端升级后 NapCat 可能需同步升级；用真实 QQ 登录存在风控/封号风险，建议机器人使用小号。
 
-## 7. 参考
+## 7. 版本控制与开源状态
+
+- 本机 git 仓库已初始化（分支 `main`），远端 `origin` 为公开仓库 <https://github.com/infinitymyheaven/qqrobottext>。
+- 推送/建仓使用 GitHub CLI（`gh`），登录账号 `infinitymyheaven`；提交作者邮箱为 GitHub noreply 邮箱。
+- GitHub 网络需走本机 Clash 代理 `http://127.0.0.1:7890`（曾直连 OAuth/raw 失败）。
+- `.gitignore` 忽略 `qq/` 等本地运行时目录；NapCat 不随仓库分发（其自有受限许可证，且目录内含 QQ 账号数据与 token）。
+- 本仓库自研代码采用 MIT；README 含开源许可与免责声明。
+
+## 8. 参考
 
 - `README.md`：面向用户的中文使用说明。
 - NapCat 官方文档：<https://napneko.github.io/>；发布页：<https://github.com/NapNeko/NapCatQQ/releases>
