@@ -1,0 +1,15 @@
+{
+  "name": "qqrobot-napcat-mini",
+  "version": "1.0.0",
+  "private": true,
+  "description": "基于 NapCat（OneBot v11）的极简 QQ 群聊机器人：群成员 @ 机器人时回复“对不起做不到。”",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
