@@ -61,7 +61,7 @@
 
 - 本机 git 仓库分支 `main`，远端 `origin`：<https://github.com/infinitymyheaven/qqrobottext>（公开）。
 - 提交作者：`infinitymyheaven` + GitHub noreply 邮箱；凭据由 GitHub CLI（`C:\Program Files\GitHub CLI\gh.exe`）管理。
-- 重构改动当前为工作区/本地状态，尚未推送时需先 `git add -A && git commit`。
+- Python 重构（Node.js → Python）已提交并推送；此后新改动按 `git add -A` → `git commit` → `git push` 同步。
 - `.gitignore` 忽略 `qq/`、`.venv/` 等；NapCat 不随仓库分发；自研代码 MIT。
 
 ## 8. 参考
