@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -136,37 +137,131 @@ def extract_message_text(payload: dict) -> str:
     return unescape(_CQ_CODE_PATTERN.sub("", raw)).strip()
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        logger.warning("环境变量 %s 不是整数，使用默认值 %s", name, default)
-        return default
+class ConfigError(ValueError):
+    """用户可修复的环境变量配置错误。"""
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
     try:
-        return float(os.getenv(name, str(default)))
+        value = default if raw is None or not raw.strip() else int(raw)
     except ValueError:
-        logger.warning("环境变量 %s 不是数字，使用默认值 %s", name, default)
+        raise ConfigError(f"{name} 必须是整数，当前值为 {raw!r}") from None
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} 不能小于 {minimum}，当前值为 {value}")
+    return value
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    try:
+        value = default if raw is None or not raw.strip() else float(raw)
+    except ValueError:
+        raise ConfigError(f"{name} 必须是数字，当前值为 {raw!r}") from None
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} 必须是有限数字，当前值为 {raw!r}")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} 不能小于 {minimum}，当前值为 {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name} 不能大于 {maximum}，当前值为 {value}")
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
         return default
+    normalized = raw.strip().casefold()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise ConfigError(
+        f"{name} 必须是 true/false、1/0、yes/no 或 on/off，当前值为 {raw!r}"
+    )
+
+
+def _env_time_minutes(name: str, default: str, *, allow_24: bool = False) -> int:
+    raw = (os.getenv(name) or default).strip()
+    match = re.fullmatch(r"(\d{2}):(\d{2})", raw)
+    if not match:
+        raise ConfigError(f"{name} 必须使用 HH:MM 格式，当前值为 {raw!r}")
+    hour, minute = map(int, match.groups())
+    if allow_24 and hour == 24 and minute == 0:
+        return 24 * 60
+    if hour > 23 or minute > 59:
+        raise ConfigError(f"{name} 不是有效时间，当前值为 {raw!r}")
+    return hour * 60 + minute
+
+
+def _env_messages(name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return defaults
+    messages = tuple(item.strip() for item in raw.split("||") if item.strip())
+    if not messages:
+        raise ConfigError(f"{name} 至少需要一条非空消息")
+    return messages
+
+
+def _env_text(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    if not value:
+        raise ConfigError(f"{name} 不能为空")
+    return value
+
+
+def _format_time(minutes: int) -> str:
+    return "24:00" if minutes == 1440 else f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 @dataclass(frozen=True)
 class BotConfig:
     active_group_ids: frozenset[str]
     timezone: ZoneInfo
-    answer_start_hour: int = 10
-    answer_end_hour: int = 19
-    spontaneous_daily_limit: int = 50
+    answer_start_minutes: int = 600
+    answer_end_minutes: int = 1140
+    spontaneous_replies_enabled: bool = True
+    spontaneous_daily_min: int = 60
+    spontaneous_daily_max: int = 100
     spontaneous_min_interval_seconds: int = 600
     spontaneous_score_threshold: float = 0.65
+    spontaneous_random_weight: float = 0.40
+    spontaneous_traffic_weight: float = 0.25
+    spontaneous_silence_weight: float = 0.35
+    spontaneous_traffic_window_seconds: int = 60
+    spontaneous_traffic_full_score_messages: int = 10
+    spontaneous_silence_full_score_seconds: int = 1200
     member_sync_interval_seconds: int = 21600
+    member_context_match_limit: int = 20
+    future_memory_enabled: bool = True
     future_memory_source: str = "active_window_all"
+    future_extraction_concurrency: int = 2
+    future_context_max_events: int = 20
     reminder_lead_minutes: int = 60
+    reminder_followup_min_minutes: int = 120
+    reminder_followup_max_minutes: int = 300
     memory_db_path: str = DEFAULT_DB_PATH
+    group_context_window_seconds: int = 300
+    group_context_max_messages: int = 20
+    group_context_message_max_chars: int = 300
     max_history_messages: int = 10
+    chat_history_ttl_minutes: int = 30
     max_reply_chars: int = 2000
+    morning_greeting_enabled: bool = True
+    night_greeting_enabled: bool = True
+    morning_messages: tuple[str, ...] = MORNING_MESSAGES
+    night_messages: tuple[str, ...] = NIGHT_MESSAGES
+    error_reply: str = DEFAULT_ERROR_REPLY
+    empty_reply: str = DEFAULT_EMPTY_REPLY
+    deepseek_timeout_seconds: float = 60.0
+    deepseek_max_tokens: int = 1024
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -175,38 +270,109 @@ class BotConfig:
             for value in (os.getenv("ACTIVE_GROUP_IDS") or "").split(",")
             if value.strip()
         )
+        invalid_group_ids = sorted(value for value in group_ids if not value.isdigit())
+        if invalid_group_ids:
+            raise ConfigError("ACTIVE_GROUP_IDS 只能包含数字群号，并使用英文逗号分隔")
         timezone_name = (os.getenv("BOT_TIMEZONE") or "Asia/Shanghai").strip()
         try:
             timezone = ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError:
-            logger.warning("未知时区 %s，使用 Asia/Shanghai", timezone_name)
-            timezone = ZoneInfo("Asia/Shanghai")
+            raise ConfigError(f"BOT_TIMEZONE 不是有效 IANA 时区：{timezone_name!r}") from None
         source = (os.getenv("FUTURE_MEMORY_SOURCE") or "active_window_all").strip()
         if source not in {"active_window_all", "participated"}:
-            logger.warning("未知 FUTURE_MEMORY_SOURCE=%s，使用 active_window_all", source)
-            source = "active_window_all"
-        start = min(23, max(0, _env_int("ANSWER_START_HOUR", 10)))
-        end = min(24, max(start + 1, _env_int("ANSWER_END_HOUR", 19)))
+            raise ConfigError(
+                "FUTURE_MEMORY_SOURCE 必须是 active_window_all 或 participated"
+            )
+        start = _env_time_minutes("ANSWER_START_TIME", "10:00")
+        end = _env_time_minutes("ANSWER_END_TIME", "19:00", allow_24=True)
+        if end <= start:
+            raise ConfigError("ANSWER_END_TIME 必须晚于 ANSWER_START_TIME")
+        daily_min = _env_int("SPONTANEOUS_DAILY_MIN", 60, minimum=0)
+        daily_max = _env_int("SPONTANEOUS_DAILY_MAX", 100, minimum=0)
+        if daily_max < daily_min:
+            raise ConfigError("SPONTANEOUS_DAILY_MAX 不能小于 SPONTANEOUS_DAILY_MIN")
+        random_weight = _env_float("SPONTANEOUS_RANDOM_WEIGHT", 0.40, minimum=0)
+        traffic_weight = _env_float("SPONTANEOUS_TRAFFIC_WEIGHT", 0.25, minimum=0)
+        silence_weight = _env_float("SPONTANEOUS_SILENCE_WEIGHT", 0.35, minimum=0)
+        if abs(random_weight + traffic_weight + silence_weight - 1.0) > 1e-6:
+            raise ConfigError("三个 SPONTANEOUS_*_WEIGHT 之和必须等于 1")
+        followup_min = _env_int("REMINDER_FOLLOWUP_MIN_MINUTES", 120, minimum=0)
+        followup_max = _env_int("REMINDER_FOLLOWUP_MAX_MINUTES", 300, minimum=0)
+        if followup_max < followup_min:
+            raise ConfigError(
+                "REMINDER_FOLLOWUP_MAX_MINUTES 不能小于 REMINDER_FOLLOWUP_MIN_MINUTES"
+            )
+        memory_path = (os.getenv("MEMORY_DB_PATH") or DEFAULT_DB_PATH).strip()
+        if not memory_path:
+            raise ConfigError("MEMORY_DB_PATH 不能为空")
         return cls(
             active_group_ids=group_ids,
             timezone=timezone,
-            answer_start_hour=start,
-            answer_end_hour=end,
-            spontaneous_daily_limit=max(0, _env_int("SPONTANEOUS_DAILY_LIMIT", 50)),
-            spontaneous_min_interval_seconds=max(
-                0, _env_int("SPONTANEOUS_MIN_INTERVAL_SECONDS", 600)
+            answer_start_minutes=start,
+            answer_end_minutes=end,
+            spontaneous_replies_enabled=_env_bool("SPONTANEOUS_REPLIES_ENABLED", True),
+            spontaneous_daily_min=daily_min,
+            spontaneous_daily_max=daily_max,
+            spontaneous_min_interval_seconds=_env_int(
+                "SPONTANEOUS_MIN_INTERVAL_SECONDS", 600, minimum=0
             ),
-            spontaneous_score_threshold=min(
-                1.0, max(0.0, _env_float("SPONTANEOUS_SCORE_THRESHOLD", 0.65))
+            spontaneous_score_threshold=_env_float(
+                "SPONTANEOUS_SCORE_THRESHOLD", 0.65, minimum=0, maximum=1
             ),
-            member_sync_interval_seconds=max(
-                60, _env_int("MEMBER_SYNC_INTERVAL_SECONDS", 21600)
+            spontaneous_random_weight=random_weight,
+            spontaneous_traffic_weight=traffic_weight,
+            spontaneous_silence_weight=silence_weight,
+            spontaneous_traffic_window_seconds=_env_int(
+                "SPONTANEOUS_TRAFFIC_WINDOW_SECONDS", 60, minimum=1
             ),
+            spontaneous_traffic_full_score_messages=_env_int(
+                "SPONTANEOUS_TRAFFIC_FULL_SCORE_MESSAGES", 10, minimum=1
+            ),
+            spontaneous_silence_full_score_seconds=_env_int(
+                "SPONTANEOUS_SILENCE_FULL_SCORE_SECONDS", 1200, minimum=1
+            ),
+            member_sync_interval_seconds=_env_int(
+                "MEMBER_SYNC_INTERVAL_SECONDS", 21600, minimum=60
+            ),
+            member_context_match_limit=_env_int(
+                "MEMBER_CONTEXT_MATCH_LIMIT", 20, minimum=0
+            ),
+            future_memory_enabled=_env_bool("FUTURE_MEMORY_ENABLED", True),
             future_memory_source=source,
-            reminder_lead_minutes=max(0, _env_int("REMINDER_LEAD_MINUTES", 60)),
-            memory_db_path=(os.getenv("MEMORY_DB_PATH") or DEFAULT_DB_PATH).strip(),
-            max_history_messages=max(0, _env_int("CHAT_HISTORY_MESSAGES", 10)),
-            max_reply_chars=max(1, _env_int("MAX_REPLY_CHARS", 2000)),
+            future_extraction_concurrency=_env_int(
+                "FUTURE_EXTRACTION_CONCURRENCY", 2, minimum=1
+            ),
+            future_context_max_events=_env_int(
+                "FUTURE_CONTEXT_MAX_EVENTS", 20, minimum=0
+            ),
+            reminder_lead_minutes=_env_int("REMINDER_LEAD_MINUTES", 60, minimum=0),
+            reminder_followup_min_minutes=followup_min,
+            reminder_followup_max_minutes=followup_max,
+            memory_db_path=memory_path,
+            group_context_window_seconds=_env_int(
+                "GROUP_CONTEXT_WINDOW_SECONDS", 300, minimum=1
+            ),
+            group_context_max_messages=_env_int(
+                "GROUP_CONTEXT_MAX_MESSAGES", 20, minimum=0
+            ),
+            group_context_message_max_chars=_env_int(
+                "GROUP_CONTEXT_MESSAGE_MAX_CHARS", 300, minimum=1
+            ),
+            max_history_messages=_env_int("CHAT_HISTORY_MESSAGES", 10, minimum=0),
+            chat_history_ttl_minutes=_env_int(
+                "CHAT_HISTORY_TTL_MINUTES", 30, minimum=0
+            ),
+            max_reply_chars=_env_int("MAX_REPLY_CHARS", 2000, minimum=1),
+            morning_greeting_enabled=_env_bool("MORNING_GREETING_ENABLED", True),
+            night_greeting_enabled=_env_bool("NIGHT_GREETING_ENABLED", True),
+            morning_messages=_env_messages("MORNING_GREETING_MESSAGES", MORNING_MESSAGES),
+            night_messages=_env_messages("NIGHT_GREETING_MESSAGES", NIGHT_MESSAGES),
+            error_reply=_env_text("AI_ERROR_REPLY", DEFAULT_ERROR_REPLY),
+            empty_reply=_env_text("EMPTY_MENTION_REPLY", DEFAULT_EMPTY_REPLY),
+            deepseek_timeout_seconds=_env_float(
+                "DEEPSEEK_TIMEOUT_SECONDS", 60.0, minimum=0.1
+            ),
+            deepseek_max_tokens=_env_int("DEEPSEEK_MAX_TOKENS", 1024, minimum=1),
         )
 
 
@@ -352,9 +518,12 @@ class QQBot:
         self._now_provider = now_provider or (lambda: datetime.now(self.config.timezone))
         self.rng = rng or random.SystemRandom()
         self._histories: dict[tuple[str, str], list[dict]] = {}
+        self._history_last_active: dict[tuple[str, str], float] = {}
         self._conversation_locks: defaultdict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)
         self._group_reply_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._extraction_semaphore = asyncio.Semaphore(2)
+        self._extraction_semaphore = asyncio.Semaphore(
+            self.config.future_extraction_concurrency
+        )
         self._recent_messages: defaultdict[str, deque] = defaultdict(deque)
         self._refresh_tasks: dict[str, asyncio.Task] = {}
         # 白名单只是用户授权范围；实际发送前还必须由 get_group_list 或群事件
@@ -369,9 +538,28 @@ class QQBot:
 
     def is_answer_time(self, now: datetime | None = None) -> bool:
         current = (now or self.now()).astimezone(self.config.timezone)
-        return self.config.answer_start_hour <= current.hour < self.config.answer_end_hour
+        minute = current.hour * 60 + current.minute
+        return self.config.answer_start_minutes <= minute < self.config.answer_end_minutes
 
     async def run(self) -> None:
+        history_ttl = (
+            f"闲置 {self.config.chat_history_ttl_minutes} 分钟过期"
+            if self.config.chat_history_ttl_minutes
+            else "不按时间过期"
+        )
+        logger.info(
+            "配置已加载：工作时段 %s-%s，主动回复%s（每日随机上限 %s-%s），"
+            "群聊上下文 %s 秒/%s 条，对话%s，未来记忆%s",
+            _format_time(self.config.answer_start_minutes),
+            _format_time(self.config.answer_end_minutes),
+            "启用" if self.config.spontaneous_replies_enabled else "禁用",
+            self.config.spontaneous_daily_min,
+            self.config.spontaneous_daily_max,
+            self.config.group_context_window_seconds,
+            self.config.group_context_max_messages,
+            history_ttl,
+            "启用" if self.config.future_memory_enabled else "禁用",
+        )
         logger.info("正在连接 NapCat（%s）...", self.log_url)
         if not self.config.active_group_ids:
             logger.warning("ACTIVE_GROUP_IDS 为空：所有回复、同步、问候和提醒均已禁用。")
@@ -484,7 +672,7 @@ class QQBot:
             spontaneous = False
             should_reply = False
             # 同一群的“评分 -> 回复 -> 计数”必须串行，否则繁忙群可能多条消息
-            # 同时看到旧的最后发言时间并一起越过十分钟间隔。
+            # 同时看到旧的最后发言时间并一起越过配置的最小间隔。
             async with self._group_reply_locks[group_id]:
                 if mentioned:
                     should_reply = True
@@ -494,7 +682,7 @@ class QQBot:
 
                 if mentioned and not text_value:
                     await self._send_group_message(
-                        ws, group_id, DEFAULT_EMPTY_REPLY, pending, now=now
+                        ws, group_id, self.config.empty_reply, pending, now=now
                     )
                 elif should_reply and text_value:
                     await self._answer_message(
@@ -511,7 +699,7 @@ class QQBot:
 
             # active_window_all：回答时段内所有候选消息都提取未来事项。
             # participated：仅从机器人实际参与回复的消息中提取。通过 .env 切换，无需改源码。
-            should_extract = text_value and (
+            should_extract = self.config.future_memory_enabled and text_value and (
                 self.config.future_memory_source == "active_window_all"
                 or (self.config.future_memory_source == "participated" and should_reply)
             )
@@ -534,11 +722,12 @@ class QQBot:
     ) -> None:
         if self.llm_client is None:
             await self._send_group_message(
-                ws, group_id, DEFAULT_ERROR_REPLY, pending, now=now, spontaneous=spontaneous
+                ws, group_id, self.config.error_reply, pending, now=now, spontaneous=spontaneous
             )
             return
         conversation_id = (group_id, user_id)
         async with self._conversation_locks[conversation_id]:
+            self._prune_expired_histories(now)
             history = self._histories.get(conversation_id, [])
             context = self._build_group_context(
                 group_id, user_id, extract_mentioned_ids(payload, self_id), question, now
@@ -548,21 +737,36 @@ class QQBot:
             except Exception:  # noqa: BLE001
                 logger.exception("调用 DeepSeek 失败")
                 await self._send_group_message(
-                    ws, group_id, DEFAULT_ERROR_REPLY, pending, now=now, spontaneous=spontaneous
+                    ws, group_id, self.config.error_reply, pending, now=now, spontaneous=spontaneous
                 )
                 return
             updated = history + [
                 {"role": "user", "content": question},
                 {"role": "assistant", "content": answer},
             ]
-            self._histories[conversation_id] = (
-                updated[-self.config.max_history_messages :]
-                if self.config.max_history_messages
-                else []
-            )
+            if self.config.max_history_messages:
+                self._histories[conversation_id] = updated[
+                    -self.config.max_history_messages :
+                ]
+                self._history_last_active[conversation_id] = now.timestamp()
+            else:
+                self._histories.pop(conversation_id, None)
+                self._history_last_active.pop(conversation_id, None)
             await self._send_group_message(
                 ws, group_id, answer, pending, now=now, spontaneous=spontaneous
             )
+
+    def _prune_expired_histories(self, now: datetime) -> None:
+        ttl_seconds = self.config.chat_history_ttl_minutes * 60
+        if not ttl_seconds:
+            return
+        cutoff = now.timestamp() - ttl_seconds
+        expired = [
+            key for key, last_active in self._history_last_active.items() if last_active < cutoff
+        ]
+        for key in expired:
+            self._histories.pop(key, None)
+            self._history_last_active.pop(key, None)
 
     def _remember_recent(
         self, group_id: str, user_id: str, text_value: str, payload: dict, now: datetime
@@ -570,24 +774,70 @@ class QQBot:
         sender = payload.get("sender") or {}
         display_name = str(sender.get("card") or sender.get("nickname") or user_id)
         queue = self._recent_messages[group_id]
-        queue.append((now.timestamp(), user_id, display_name, text_value[:300]))
-        cutoff = now.timestamp() - 60
+        queue.append(
+            (
+                now.timestamp(),
+                user_id,
+                display_name,
+                text_value[: self.config.group_context_message_max_chars],
+            )
+        )
+        retention = max(
+            self.config.group_context_window_seconds,
+            self.config.spontaneous_traffic_window_seconds,
+        )
+        cutoff = now.timestamp() - retention
         while queue and queue[0][0] < cutoff:
+            queue.popleft()
+        storage_limit = max(
+            self.config.group_context_max_messages,
+            self.config.spontaneous_traffic_full_score_messages,
+        )
+        while len(queue) > storage_limit:
             queue.popleft()
 
     def _should_reply_spontaneously(self, group_id: str, now: datetime) -> bool:
+        if not self.config.spontaneous_replies_enabled:
+            return False
         activity = self.memory.get_activity(group_id, now.date().isoformat())
-        if activity["spontaneous_count"] >= self.config.spontaneous_daily_limit:
+        daily_limit = self.memory.ensure_daily_spontaneous_limit(
+            group_id,
+            now.date().isoformat(),
+            self.config.spontaneous_daily_min,
+            self.config.spontaneous_daily_max,
+            self.rng.randint(
+                self.config.spontaneous_daily_min,
+                self.config.spontaneous_daily_max,
+            ),
+        )
+        if activity["spontaneous_count"] >= daily_limit:
             return False
         last_sent = activity["last_bot_sent_at"]
         silence = float("inf") if last_sent is None else max(0.0, now.timestamp() - last_sent)
         if silence < self.config.spontaneous_min_interval_seconds:
             return False
-        message_count = len(self._recent_messages[group_id])
-        traffic_score = min(message_count / 10.0, 1.0)
-        silence_score = min(silence / 1200.0, 1.0)
-        score = 0.40 * self.rng.random() + 0.25 * traffic_score + 0.35 * silence_score
-        logger.debug("群 %s 主动回复评分 %.3f（近一分钟 %s 条）", group_id, score, message_count)
+        traffic_cutoff = now.timestamp() - self.config.spontaneous_traffic_window_seconds
+        message_count = sum(
+            1 for sent_at, *_ in self._recent_messages[group_id] if sent_at >= traffic_cutoff
+        )
+        traffic_score = min(
+            message_count / self.config.spontaneous_traffic_full_score_messages, 1.0
+        )
+        silence_score = min(
+            silence / self.config.spontaneous_silence_full_score_seconds, 1.0
+        )
+        score = (
+            self.config.spontaneous_random_weight * self.rng.random()
+            + self.config.spontaneous_traffic_weight * traffic_score
+            + self.config.spontaneous_silence_weight * silence_score
+        )
+        logger.debug(
+            "群 %s 主动回复评分 %.3f（近 %s 秒 %s 条）",
+            group_id,
+            score,
+            self.config.spontaneous_traffic_window_seconds,
+            message_count,
+        )
         return score >= self.config.spontaneous_score_threshold
 
     def _build_group_context(
@@ -610,7 +860,10 @@ class QQBot:
                 selected[uid] = member
         include_inactive = any(word in question for word in ("以前", "曾经", "退群", "过去"))
         for member in self.memory.search_members(
-            group_id, question, include_inactive=include_inactive, limit=20
+            group_id,
+            question,
+            include_inactive=include_inactive,
+            limit=self.config.member_context_match_limit,
         ):
             selected[member["user_id"]] = member
 
@@ -624,16 +877,27 @@ class QQBot:
                 f"- {display}（QQ {member['user_id']}，{role}{title}，{state}）"
             )
 
-        events = self.memory.get_active_events(group_id, now.timestamp(), limit=20)
+        events = (
+            self.memory.get_active_events(
+                group_id, now.timestamp(), limit=self.config.future_context_max_events
+            )
+            if self.config.future_memory_enabled
+            else []
+        )
         if events:
             lines.append("仍有效的未来事项：")
             for event in events:
                 event_time = datetime.fromtimestamp(event["event_at"], self.config.timezone)
                 lines.append(f"- {event_time:%Y-%m-%d %H:%M}：{event['summary']}")
 
-        recent = list(self._recent_messages[group_id])[-20:]
+        recent_cutoff = now.timestamp() - self.config.group_context_window_seconds
+        recent = [
+            item for item in self._recent_messages[group_id] if item[0] >= recent_cutoff
+        ][-self.config.group_context_max_messages :]
+        if self.config.group_context_max_messages == 0:
+            recent = []
         if recent:
-            lines.append("最近一分钟群聊：")
+            lines.append(f"最近 {self.config.group_context_window_seconds} 秒群聊：")
             lines.extend(f"- {name}：{text_value}" for _, _, name, text_value in recent)
         return "\n".join(lines)
 
@@ -683,26 +947,25 @@ class QQBot:
 
     def _adjust_reminder_before(self, moment: datetime) -> datetime:
         local = moment.astimezone(self.config.timezone)
-        start = datetime.combine(local.date(), time(self.config.answer_start_hour), self.config.timezone)
-        end = datetime.combine(local.date(), time(self.config.answer_end_hour % 24), self.config.timezone)
-        if self.config.answer_end_hour == 24:
-            end = start.replace(hour=0) + timedelta(days=1)
+        day = datetime.combine(local.date(), time(0), self.config.timezone)
+        start = day + timedelta(minutes=self.config.answer_start_minutes)
+        end = day + timedelta(minutes=self.config.answer_end_minutes)
         if local < start:
-            previous = start - timedelta(days=1)
-            return previous.replace(hour=self.config.answer_end_hour - 1, minute=59, second=59)
+            previous_day = day - timedelta(days=1)
+            return (
+                previous_day
+                + timedelta(minutes=self.config.answer_end_minutes)
+                - timedelta(seconds=1)
+            )
         if local >= end:
             return end - timedelta(seconds=1)
         return local
 
     def _adjust_to_next_answer_time(self, moment: datetime) -> datetime:
         local = moment.astimezone(self.config.timezone)
-        start = datetime.combine(local.date(), time(self.config.answer_start_hour), self.config.timezone)
-        end_hour = self.config.answer_end_hour
-        end = (
-            datetime.combine(local.date(), time(end_hour), self.config.timezone)
-            if end_hour < 24
-            else datetime.combine(local.date() + timedelta(days=1), time(0), self.config.timezone)
-        )
+        day = datetime.combine(local.date(), time(0), self.config.timezone)
+        start = day + timedelta(minutes=self.config.answer_start_minutes)
+        end = day + timedelta(minutes=self.config.answer_end_minutes)
         if local < start:
             return start
         if local >= end:
@@ -799,14 +1062,19 @@ class QQBot:
         now = self.now()
         local_date = now.date().isoformat()
         active = self.is_answer_time(now)
+        current_minute = now.hour * 60 + now.minute
         for group_id in sorted(self._joined_group_ids):
             async with self._group_reply_locks[group_id]:
                 activity = self.memory.get_activity(group_id, local_date)
-                if active and not activity["morning_sent"]:
+                if (
+                    active
+                    and self.config.morning_greeting_enabled
+                    and not activity["morning_sent"]
+                ):
                     if not await self._send_scheduled_message(
                         ws,
                         group_id,
-                        self.rng.choice(MORNING_MESSAGES),
+                        self.rng.choice(self.config.morning_messages),
                         pending,
                         now=now,
                         morning=True,
@@ -814,20 +1082,21 @@ class QQBot:
                         continue
                 if (
                     not active
-                    and now.hour == self.config.answer_end_hour
-                    and now.minute < 10
+                    and self.config.night_greeting_enabled
+                    and self.config.answer_end_minutes <= current_minute
+                    < self.config.answer_end_minutes + 10
                     and not activity["night_sent"]
                 ):
                     await self._send_scheduled_message(
                         ws,
                         group_id,
-                        self.rng.choice(NIGHT_MESSAGES),
+                        self.rng.choice(self.config.night_messages),
                         pending,
                         now=now,
                         night=True,
                     )
 
-        if not active:
+        if not active or not self.config.future_memory_enabled:
             return
         for event in self.memory.due_initial_reminders(now.timestamp()):
             if event["group_id"] not in self._joined_group_ids:
@@ -840,7 +1109,12 @@ class QQBot:
                 )
                 if not sent:
                     continue
-                followup = now + timedelta(hours=self.rng.uniform(2, 5))
+                followup = now + timedelta(
+                    minutes=self.rng.uniform(
+                        self.config.reminder_followup_min_minutes,
+                        self.config.reminder_followup_max_minutes,
+                    )
+                )
                 followup = self._adjust_to_next_answer_time(followup)
                 self.memory.mark_reminded(
                     event["id"], now.timestamp(), followup.timestamp()
@@ -925,21 +1199,31 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    try:
+        config = BotConfig.from_env()
+        deepseek_base_url = _env_text("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
+        deepseek_model = _env_text("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL)
+        deepseek_system_prompt = _env_text(
+            "DEEPSEEK_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT
+        )
+        napcat_ws_url = _env_text("NAPCAT_WS_URL", DEFAULT_WS_URL)
+    except ConfigError as exc:
+        logger.error("配置错误：%s", exc)
+        return 2
     api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
         logger.error("缺少 DEEPSEEK_API_KEY，请在 .env 中填写 DeepSeek API Key。")
         return 2
     llm_client = DeepSeekClient(
         api_key,
-        base_url=(os.getenv("DEEPSEEK_BASE_URL") or DEFAULT_DEEPSEEK_BASE_URL).strip(),
-        model=(os.getenv("DEEPSEEK_MODEL") or DEFAULT_DEEPSEEK_MODEL).strip(),
-        system_prompt=os.getenv("DEEPSEEK_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip(),
-        timeout_seconds=_env_int("DEEPSEEK_TIMEOUT_SECONDS", 60),
-        max_tokens=_env_int("DEEPSEEK_MAX_TOKENS", 1024),
+        base_url=deepseek_base_url,
+        model=deepseek_model,
+        system_prompt=deepseek_system_prompt,
+        timeout_seconds=config.deepseek_timeout_seconds,
+        max_tokens=config.deepseek_max_tokens,
     )
-    config = BotConfig.from_env()
     bot = QQBot(
-        (os.getenv("NAPCAT_WS_URL") or DEFAULT_WS_URL).strip(),
+        napcat_ws_url,
         (os.getenv("NAPCAT_WS_TOKEN") or "").strip(),
         llm_client=llm_client,
         config=config,

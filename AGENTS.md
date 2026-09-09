@@ -1,77 +1,115 @@
-# AGENTS.md — QQ 群智能 DeepSeek 机器人速查
+# AGENTS.md — QQ 群智能 DeepSeek 机器人接手指南
 
-## 1. 项目与当前分支
+## 1. 项目目标与当前状态
 
-- 项目：`qqrobottext`，Python QQ 群机器人。
-- 开发分支：`智能ai分支`；基于 `main` 的提交 `1189ac6` 创建，不要自动合并回 `main`。
-- 架构：NapCat OneBot v11 正向 WebSocket + Python 客户端 + DeepSeek Chat Completions + SQLite。
-- 功能：白名单群成员同步、身份/头衔永久记忆、10:00–19:00 作息、智能主动回复、未来事项提醒。
-- 依赖：`websockets`、`tzdata`；其余使用 Python 标准库。Python 3.10+。
+- 项目名：`qqrobottext`，Python 3.10+ 的 QQ 群聊机器人。
+- 功能开发分支：`智能ai分支`，跟踪 `origin/智能ai分支`；PR #1 已把截至 `ca0b98e` 的功能合入 `main`，后续配置与文档提交也将按用户要求同步到 `main`。
+- `main` 和 `智能ai分支` 都是远端有效分支。开始工作前必须先 `git fetch origin` 并检查双方状态，不要假定或硬编码分支头提交。
+- 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek OpenAI 兼容 Chat Completions API。
+- 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、@回答、算法主动插话、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
+- 最近功能版本：`8afeadc`，已完成行为参数 `.env` 化、严格配置校验和每日随机主动回复上限。
+- 自动化测试不连接真实 QQ，也不调用 DeepSeek；配置升级后的真实群聊端到端验证仍需人工执行。
 
-## 2. 关键文件与命令
+## 2. 代码地图与启动命令
 
-- `src/bot.py`：配置、DeepSeek 客户端、OneBot 连接、回答策略、同步和提醒调度。
-- `src/memory.py`：SQLite 表结构和所有持久化读写。
-- `tests/test_bot.py` / `tests/test_memory.py`：模拟 API、策略和持久化测试。
-- `.env.example`：全部配置；真实 `.env` 已忽略。
-- 运行：`.venv\Scripts\python.exe src\bot.py`
-- 测试：`.venv\Scripts\python.exe -m unittest discover -s tests -v`
-- 本机 `.venv` 基础解释器：`D:\codex\python-runtimes\cpython-3.12.14-windows-x86_64-none\python.exe`。不要改回 Codex 应用隔离的 `AppData\Roaming\uv` 路径。
+- `src/bot.py`：`.env` 读取与校验、DeepSeek HTTP 客户端、OneBot WebSocket、消息处理、上下文构造、主动回复算法、成员同步和提醒调度。
+- `src/memory.py`：SQLite 建表/迁移以及成员资料、资料历史、未来事项和每日活动读写。
+- `tests/test_bot.py`：消息解析、配置、时间边界、上下文、同步、问候、主动回复和提醒测试。
+- `tests/test_memory.py`：成员历史、退群状态、事项去重、每日随机上限和旧库迁移测试。
+- `.env.example`：所有公开配置及默认值的唯一权威模板；README 里的配置表必须与它同步。
+- `README.md`：用户安装、NapCat 配置、行为说明和完整配置参考。
 
-## 3. 安全边界与配置
+Windows 本机命令：
 
-- `ACTIVE_GROUP_IDS` 是英文逗号分隔的 QQ 群号白名单；为空时禁用回复、同步、问候和提醒。
-- 白名单不等于已入群：每次连接先用 `get_group_list` 验证实际在群状态，只有交集群会同步和主动发送；群消息/通知也会实时更新已入群集合。
-- 回答窗口默认 `[10:00, 19:00)`，时区 `Asia/Shanghai`；窗口外被 @ 也不回答。
-- `FUTURE_MEMORY_SOURCE=active_window_all` 默认扫描回答时段内日期候选消息；改为 `participated` 只分析机器人参与的消息。两套逻辑在 `_handle_group_message()` 有注释，README 必须保持显著说明。
-- `DEEPSEEK_API_KEY` 必填。任何真实 API Key、NapCat WebUI Token、群号白名单、数据库内容或 QQ 登录数据都不得写入文档或提交。
-- `.env`、`data/`、`qq/`、`.venv/` 和 `.venv-virtualized-old/` 均应保持忽略。
+```powershell
+cd D:\codex\qqrobot
+.\.venv\Scripts\python.exe src\bot.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
 
-## 4. 成员资料与上下文
+- 不要调用系统商店的 `python`；项目 `.venv` 的基础解释器位于 `D:\codex\python-runtimes\cpython-3.12.14-windows-x86_64-none\python.exe`。
+- 启动顺序是先以管理员身份运行 `qq\napcat\launcher-fixed.bat` 并登录 QQ，再启动 Python 机器人。
+- `.env` 修改后必须重启机器人；停止进程使用 `Ctrl+C`。
 
-- 连接后调用 `get_group_list` 和每个白名单群的 `get_group_member_list(no_cache=true)`；每 21600 秒重做全量同步。
-- 定时问候或提醒遇到 OneBot 动作失败时只暂停对应群，不允许异常结束调度器并触发 WebSocket 重连循环。
-- `group_increase`、`group_decrease`、`group_admin`、`group_card` 通知会延迟 2 秒刷新该群并合并重复刷新。
-- SQLite 默认 `data/bot_memory.sqlite3`：
-  - `groups`：群名与最后同步时间。
-  - `members`：当前昵称、群名片、`role`、专属头衔、首次/最后发现、是否仍在群。
-  - `member_history`：仅在资料或活跃状态变化时追加快照，永不因上下文截断删除。
-  - `future_events`：未来事项、提醒、确认和二次提醒状态。
-  - `bot_activity`：每群每日主动回复数、早晚问候和最后发言时间。
-- AI 上下文始终包含发言者、当前群主/管理员、被 @ 的其他成员、问题中按 QQ/昵称/群名片/头衔命中的成员，以及最多 20 条有效未来事项和最近一分钟最多 20 条消息。
-- 普通对话历史仍以 `(group_id, user_id)` 隔离并受 `CHAT_HISTORY_MESSAGES` 限制；永久结构化资料不在该限制内。
+## 3. 配置约定
 
-## 5. 主动回复与作息算法
+- `main()` 先调用 `load_env_file()`，再由 `BotConfig.from_env()` 严格解析；配置错误必须在连接 NapCat 前以状态码 2 退出。
+- 布尔值只接受 `true/false`、`1/0`、`yes/no`、`on/off`；数值、时区、时间、区间和权重不允许静默回退或自动截断。
+- `ANSWER_START_TIME` / `ANSWER_END_TIME` 使用 `HH:MM`，开始包含、结束不包含；允许 `00:00–24:00`，但不支持跨午夜倒置区间。
+- 旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR`、`SPONTANEOUS_DAILY_LIMIT` 已废弃，不要恢复兼容逻辑。
+- `ACTIVE_GROUP_IDS` 使用英文逗号分隔；空值表示完全禁用同步、回复、问候和提醒。
+- 白名单只是授权范围。实际发送还要求群号存在于 NapCat `get_group_list` 结果或已由实时群事件确认；未入群/已退群不能触发重连循环。
+- 三个主动回复权重必须非负且总和为 1。当前默认公式：
 
-- 回答时段内 @ 必答且不占主动额度；普通文字消息才参与随机判断。
-- 每群每天最多 50 条主动回复，最小间隔 600 秒。
-- 评分：`0.40*随机数 + 0.25*min(近60秒消息数/10,1) + 0.35*min(沉默秒数/1200,1)`；默认阈值 `0.65`。
-- 所有成功发出的机器人消息都会更新 `last_bot_sent_at`；只有算法触发回复增加 `spontaneous_count`。
-- 10:00 后调度器发送一次随机早安；19:00–19:09 发送一次随机晚安。持久化标志防止重连重复发送。
-- 后台同步或调度任务异常会结束当前连接会话，由外层 3 秒重连恢复，避免功能静默失效。
+```text
+0.40 × random.random()
++ 0.25 × min(流量窗口消息数 / 10, 1)
++ 0.35 × min(沉默秒数 / 1200, 1)
+```
 
-## 6. 未来事项规则
+- 默认主动回复日上限不是固定值：每群每天从 `SPONTANEOUS_DAILY_MIN=60` 到 `SPONTANEOUS_DAILY_MAX=100` 随机抽取并持久化；@回复、问候和提醒不计入。
+- `FUTURE_MEMORY_SOURCE=active_window_all` 会分析工作时段内全部日期候选消息；`participated` 只分析机器人实际参与的消息。`FUTURE_MEMORY_ENABLED=false` 同时关闭提取、上下文注入和提醒。
+- 早晚问候模板使用 `||` 分隔；模板、开关、上下文窗口、提醒区间和所有用户行为参数均以 `.env.example` 为准。
 
-- 本地 `_DATE_CUE_PATTERN` 先过滤，DeepSeek 再输出 JSON：`events[{summary,event_at}]`。
-- 相对日期按当前 `BOT_TIMEZONE` 解析；仅日期默认 23:59；过去或格式无效的事项丢弃；相同群、来源、摘要和时间去重。
-- 初次提醒默认提前 60 分钟且不 @；睡眠时段的提醒提前移动到最近的回答时段。
-- 初次提醒后，来源成员在同群发任意消息即写入确认状态。
-- 未确认时随机 2–5 小时后准备二次 @；若事项届时已过期，SQL 查询会自动排除，不发送。
-- 提醒状态持久化，重启后不会重复发送。
+## 4. 消息与并发流程
 
-## 7. 本机与版本控制事实
+1. `_read_loop()` 按 `echo` 完成 OneBot 动作 Future；群消息和通知分别创建后台任务。
+2. `_handle_group_message()` 先验证白名单、排除机器人自身消息，再记录最近群聊和提醒确认；工作时段外立即静默。
+3. 工作时段内，@消息必答；普通文字消息在群级锁内执行每日上限、最小间隔和评分判断。
+4. `_answer_message()` 使用 `(group_id, user_id)` 对话锁隔离历史；历史同时受条数和闲置 TTL 限制。
+5. `_build_group_context()` 按需加入发言者、群主/管理员、明确 @ 或名称命中的成员、有效未来事项及近期群聊，不允许把完整大群名册塞进每次 API 请求。
+6. DeepSeek 成功后才更新对话历史；所有成功发送的机器人消息更新沉默时间，只有算法主动插话增加主动回复计数。
+7. 日期关键词先经本地正则过滤，再在独立 Semaphore 内调用 DeepSeek 提取结构化事项。
 
-- QQ：`D:\Program Files\Tencent\QQNT\QQ.exe`；NapCat 使用 `qq/napcat/launcher-fixed.bat`。
-- OneBot：`127.0.0.1:3001`、数组消息格式、Token 默认空。NapCat 控制台必须保持运行。
-- 2026-09-09 09:05 的最后一次启动检查中端口 3001 拒绝连接，说明当时 NapCat 未运行；端到端验收前需重新启动。
-- `qq/napcat/config/webui.json` 含敏感 Token，不得读取后输出或提交。
-- 远端：`https://github.com/infinitymyheaven/qqrobottext`。GitHub 网络使用仓库既有代理配置。
-- 实现完成后先运行全部测试、语法检查、`git diff --check` 和疑似密钥扫描，再提交并仅推送 `智能ai分支`。
+并发不变量：
 
-## 8. 验收重点
+- 同群“评分 → 回复 → 计数”必须持有 `_group_reply_locks[group_id]`，避免并发消息绕过间隔或日上限。
+- 同一成员的对话必须持有 `_conversation_locks[(group_id, user_id)]`，不同成员可并行。
+- OneBot 动作失败使用 `OneBotActionError`；定时发送失败只暂停对应群，不得使整个调度器退出。
+- `_run_connection()` 中读取循环、定时同步和调度任务任一意外结束时应取消其余任务并重连，避免“连接在线但后台功能死亡”。
 
-- 白名单为空完全静默；非白名单群不读资料、不回复。
-- 名册无需群友发言即可识别群主、管理员、群名片和专属头衔；重启后资料仍在。
-- 10:00/19:00 边界、@必答、普通消息权重、十分钟间隔和每日上限正确。
-- 两种日期来源模式、提醒时段调整、任意消息确认、过期取消二次 @ 正确。
-- 测试不得调用真实 DeepSeek 或向真实 QQ 群发消息。
+## 5. SQLite 长期记忆
+
+默认数据库为 `data/bot_memory.sqlite3`，`data/` 必须保持忽略：
+
+- `groups`：群名、最后同步时间。
+- `members`：昵称、群名片、角色、专属头衔、首次/最后发现时间、当前是否在群。
+- `member_history`：成员资料或活跃状态变化时追加快照；退群成员标记为非活跃，不能删除历史。
+- `future_events`：事项摘要、来源、事件时间、初次提醒、确认及二次提醒状态。
+- `bot_activity`：每群每日主动回复数、随机日上限、问候状态和最后发言时间。
+
+兼容要求：
+
+- `_create_schema()` 使用 `CREATE TABLE IF NOT EXISTS`，并通过 `PRAGMA table_info` + `ALTER TABLE` 为旧库补充 `daily_spontaneous_limit`，不得重建或清空用户数据库。
+- 每日随机上限按 `(group_id, local_date)` 隔离；重启保持不变。配置区间改变且旧值越界时，当天重新抽取。
+- 成员每次全量同步后，本次缺失的旧成员只标记 `is_active=0`；资料历史永久保存。
+- 普通群聊和逐成员聊天历史只存在内存中，不写入 SQLite；重启后允许丢失。
+
+## 6. 作息、问候和提醒边界
+
+- 工作窗口按配置分钟数判断，开始时刻包含、结束时刻排除；窗口外即使被 @ 也不回答。
+- 早安在当天首次进入工作窗口时发送一次；晚安只在结束后的 10 分钟内发送一次。SQLite 防止重连重复发送。
+- 最近群聊默认 300 秒、最多 20 条、每条 300 字；流量评分使用独立窗口，不能因修改群聊上下文时间而改变统计语义。
+- 逐成员对话默认最多 10 条消息、闲置 30 分钟过期；TTL 为 0 时只按条数限制。
+- 未来事项默认提前 60 分钟提醒；落在休息时段时移动到此前最近的工作窗口。
+- 初次提醒只发普通文本；来源成员之后在同群发送任意消息即确认。
+- 未确认事项按配置的分钟区间等待二次 @；若事项已过期则取消。
+
+## 7. 安全、测试与发布清单
+
+- 永远不要读取后输出或提交真实 `DEEPSEEK_API_KEY`、`NAPCAT_WS_TOKEN`、群号白名单、SQLite 内容或 `qq/napcat/config/webui.json`。
+- `.env`、`data/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore` 中。
+- 测试只使用临时 SQLite、模拟 WebSocket 和模拟 DeepSeek；不得向真实群发消息或消耗真实 API 额度。
+- 修改后至少执行：完整单元测试、`py_compile`、`git diff --check`、Git 状态检查和暂存区敏感值扫描。
+- 配置新增/改名时必须同步修改 `.env.example`、README 配置表、`BotConfig` 严格校验和配置测试。
+- 数据库字段变化必须提供针对旧 schema 的无损迁移测试。
+- 提交前确认工作区干净、目标分支明确且远端没有未知提交；默认不要跨分支推送，只有用户明确要求时才同步或合并到 `main`。
+- 远端仓库：`https://github.com/infinitymyheaven/qqrobottext`。
+
+## 8. 已知运行环境与排障
+
+- QQ 客户端：`D:\Program Files\Tencent\QQNT\QQ.exe`；NapCat 本地目录为被忽略的 `qq/`。
+- OneBot 默认地址：`ws://127.0.0.1:3001`，消息格式必须为数组；Access Token 两端配置必须一致。
+- 日志显示“已同步群 … 的 0 名成员”时，先确认机器人账号确实在该群；当前版本会跳过 `get_group_list` 中不存在的白名单群。
+- @无回复时依次检查：群是否在白名单、机器人是否仍在群、当前是否处于工作窗口、NapCat 是否持续运行、DeepSeek Key/余额及模型名是否有效。
+- 启动后没有持续日志通常表示正在等待消息，不代表程序卡死。
