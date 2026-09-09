@@ -128,6 +128,66 @@ class MemoryStoreTest(unittest.TestCase):
         activity = self.store.get_activity("g", "d")
         self.assertEqual(activity["spontaneous_count"], 4)
         self.assertIsNone(activity["daily_spontaneous_limit"])
+        # 旧库打开后会原地补建规范化画像表，不需要删除或重建数据库。
+        tables = {
+            row[0]
+            for row in self.store.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertTrue(
+            {
+                "speech_member_profiles",
+                "speech_member_features",
+                "speech_bot_profiles",
+                "speech_bot_features",
+            }.issubset(tables)
+        )
+
+    def test_sql_speech_profiles_persist_decay_and_sparse_features(self):
+        self.store.observe_speech_message(
+            "g",
+            "u",
+            100.0,
+            {1: 1.0, 9: 0.5},
+            activity_half_life_seconds=100.0,
+            interest_learning_rate=0.2,
+        )
+        self.store.record_speech_reply(
+            "g",
+            "u",
+            100.0,
+            {1: 1.0},
+            bond_half_life_seconds=1000.0,
+            bond_learning_rate=0.1,
+            interest_learning_rate=0.2,
+        )
+        self.store.close()
+        self.store = MemoryStore(self.db_path)
+        member, bot = self.store.get_speech_profiles(
+            "g",
+            "u",
+            200.0,
+            activity_half_life_seconds=100.0,
+            bond_half_life_seconds=1000.0,
+        )
+        self.assertAlmostEqual(member["activity_value"], 0.5)
+        self.assertAlmostEqual(member["bond_value"], 0.1 * 0.5 ** 0.1)
+        self.assertEqual(member["message_count"], 1)
+        self.assertEqual(member["reply_count"], 1)
+        self.assertEqual(bot["reply_count"], 1)
+        self.assertEqual(
+            self.store.conn.execute(
+                "SELECT COUNT(*) FROM speech_member_features"
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            self.store.conn.execute(
+                "SELECT COUNT(*) FROM speech_bot_features"
+            ).fetchone()[0],
+            1,
+        )
 
 
 if __name__ == "__main__":

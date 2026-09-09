@@ -3,10 +3,10 @@
 ## 1. 项目目标与当前状态
 
 - 项目名：`qqrobottext`，Python 3.10+ 的 QQ 群聊机器人。
-- 当前开发分支：`main`，跟踪 `origin/main`。`main`、`智能ai分支` 和 `联网信息` 都是远端有效分支。
+- 当前算法重构分支：`codex/refactor-speech-decision`，基于 `origin/main` 的最新状态创建；原 `main` 工作区保持不动。
 - 开始工作前必须先 `git fetch origin` 并检查目标分支状态，不要假定或硬编码分支头提交。
 - 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek Responses API（群聊与联网）/ Chat Completions API（未来事项提取及关闭联网后的聊天）。
-- 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、@回答、算法主动插话、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
+- 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、多因素概率回答、SQL 长期兴趣/关系画像、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
 - PR #2 已将 `联网信息` 的 Responses API 服务端 `web_search` 能力合入 `main`。
 - 自动化测试不连接真实 QQ，也不调用 DeepSeek；配置升级后的真实群聊端到端验证仍需人工执行。
 
@@ -40,17 +40,18 @@ cd D:\codex\qqrobot
 - 旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR`、`SPONTANEOUS_DAILY_LIMIT` 已废弃，不要恢复兼容逻辑。
 - `ACTIVE_GROUP_IDS` 使用英文逗号分隔；空值表示完全禁用同步、回复、问候和提醒。
 - 白名单只是授权范围。实际发送还要求群号存在于 NapCat `get_group_list` 结果或已由实时群事件确认；未入群/已退群不能触发重连循环。
-- 三个主动回复权重必须非负且总和为 1。当前默认公式：
+- 所有候选消息（包括 @）使用成员活跃度、群活跃度、话题熟悉度、关系强度、@状态、消息相关性、趣味度、随机噪声及两个交互项计算原始分，再用 Sigmoid 转成概率。权重必须非负，学习率必须在 0–1 内。
 
 ```text
-0.40 × random.random()
-+ 0.25 × min(流量窗口消息数 / 10, 1)
-+ 0.35 × min(沉默秒数 / 1200, 1)
+probability = sigmoid(6 × (raw_score - 0.65))
 ```
 
-- 默认主动回复日上限不是固定值：每群每天从 `SPONTANEOUS_DAILY_MIN=60` 到 `SPONTANEOUS_DAILY_MAX=100` 随机抽取并持久化；@回复、问候和提醒不计入。
+- 默认 `SPEAK_WEIGHT_IS_MENTIONED=1.0`，用于将典型 @ 回答概率校准到约 90%；普通高相关消息通常约为 10%–30%。修改默认权重时必须同步概率区间测试。
+- 默认普通主动回复日上限不是固定值：每群每天从 `SPONTANEOUS_DAILY_MIN=60` 到 `SPONTANEOUS_DAILY_MAX=100` 随机抽取并持久化；@回复仍经过概率算法，但豁免日上限和最小间隔；问候和提醒不经过算法。
+- `SPONTANEOUS_SCORE_THRESHOLD`、`SPONTANEOUS_RANDOM_WEIGHT`、`SPONTANEOUS_TRAFFIC_WEIGHT`、`SPONTANEOUS_SILENCE_WEIGHT`、`SPONTANEOUS_SILENCE_FULL_SCORE_SECONDS` 已被 `SPEAK_*` 配置取代，不要恢复旧公式。
 - `FUTURE_MEMORY_SOURCE=active_window_all` 会分析工作时段内全部日期候选消息；`participated` 只分析机器人实际参与的消息。`FUTURE_MEMORY_ENABLED=false` 同时关闭提取、上下文注入和提醒。
-- `WEB_SEARCH_ENABLED=true` 时群聊走 `/responses`：普通问题使用 `tool_choice=auto`，明确联网搜索或当前时间问题强制 `web_search`；关闭后回退到原 `/chat/completions`。
+- “现在几点”“当前时间”等本地时间问题直接由 `DeepSeekClient.chat()` 使用传入的带时区 `now` 回答，不调用 API；不要再把本地时间问题强制路由到 `web_search`。
+- `WEB_SEARCH_ENABLED=true` 时其余群聊走 `/responses`：普通问题使用 `tool_choice=auto`，只有明确联网搜索才强制 `web_search`；关闭后回退到原 `/chat/completions`。
 - 联网失败、不完整或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得改用未经核验的实时答案。来源只按 `WEB_SEARCH_LOG_SOURCES` 和 `WEB_SEARCH_MAX_LOG_SOURCES` 写入后端日志。
 - 早晚问候模板使用 `||` 分隔；模板、开关、上下文窗口、提醒区间和所有用户行为参数均以 `.env.example` 为准。
 - 错误现场日志默认只在内存保留最近 30 条状态；`ERROR` 才写入错误前 30 条、错误堆栈和后 10 条。默认单文件 1 MiB、保留 2 个轮换文件，路径为被忽略的 `logs/error_context.txt`。不要改成全量文件日志。
@@ -58,13 +59,14 @@ cd D:\codex\qqrobot
 ## 4. 消息与并发流程
 
 1. `_read_loop()` 按 `echo` 完成 OneBot 动作 Future；群消息和通知分别创建后台任务。
-2. `_handle_group_message()` 先验证白名单、排除机器人自身消息，再记录最近群聊和提醒确认；工作时段外立即静默。
-3. 工作时段内，@消息必答；普通文字消息在群级锁内执行每日上限、最小间隔和评分判断。
+2. `_handle_group_message()` 先验证白名单、排除机器人自身消息并确认提醒；工作时段外不回复，但文字仍更新 SQL 成员画像和近期群聊。
+3. 工作时段内，所有候选消息在群级锁内执行多因素概率判断；普通文字先检查每日上限和最小间隔，@只豁免这两个门槛而不豁免概率。
 4. `_answer_message()` 使用 `(group_id, user_id)` 对话锁隔离历史；历史同时受条数和闲置 TTL 限制。
 5. `_build_group_context()` 按需加入发言者、群主/管理员、明确 @ 或名称命中的成员、有效未来事项及近期群聊，不允许把完整大群名册塞进每次 API 请求；联网路径还会隐藏 QQ 数字标识。
-6. DeepSeek 成功后才更新对话历史；所有成功发送的机器人消息更新沉默时间，只有算法主动插话增加主动回复计数。
-7. 日期关键词先经本地正则过滤，再在独立 Semaphore 内调用 DeepSeek 提取结构化事项。
-8. 联网回答解析 `/responses.output` 中的 `message/output_text`，忽略 reasoning；搜索来源 URL 只打印到 PowerShell，不拼进 QQ 回复。接口未返回 URL 时只记录搜索动作类型。
+6. DeepSeek 回答成功发送后才更新对话历史、机器人兴趣和关系强度；所有成功发送的机器人消息更新时间，只有普通算法主动插话增加主动回复计数。
+7. 每条白名单群内的他人消息输出单行 `speech_decision` JSON：始终含权重、是否发言和原因；完成评分时还含特征值、贡献、原始分及概率。常规判定日志不得记录消息正文。
+8. 日期关键词先经本地正则过滤，再在独立 Semaphore 内调用 DeepSeek 提取结构化事项。
+9. 联网回答解析 `/responses.output` 中的 `message/output_text`，忽略 reasoning；搜索来源 URL 只打印到 PowerShell，不拼进 QQ 回复。接口未返回 URL 时只记录搜索动作类型。
 
 并发不变量：
 
@@ -82,6 +84,10 @@ cd D:\codex\qqrobot
 - `member_history`：成员资料或活跃状态变化时追加快照；退群成员标记为非活跃，不能删除历史。
 - `future_events`：事项摘要、来源、事件时间、初次提醒、确认及二次提醒状态。
 - `bot_activity`：每群每日主动回复数、随机日上限、问候状态和最后发言时间。
+- `speech_member_profiles`：成员衰减活跃值、关系强度、消息数和成功回答数。
+- `speech_member_features`：成员兴趣的稀疏 128 维特征，每个非零维度一行。
+- `speech_bot_profiles`：机器人在每个群的回答次数与画像更新时间。
+- `speech_bot_features`：机器人在每个群参与过的话题稀疏特征。
 
 兼容要求：
 
@@ -89,10 +95,11 @@ cd D:\codex\qqrobot
 - 每日随机上限按 `(group_id, local_date)` 隔离；重启保持不变。配置区间改变且旧值越界时，当天重新抽取。
 - 成员每次全量同步后，本次缺失的旧成员只标记 `is_active=0`；资料历史永久保存。
 - 普通群聊和逐成员聊天历史只存在内存中，不写入 SQLite；重启后允许丢失。
+- 发言画像使用规范化 SQL 表、事务和 `UPSERT` 管理，不允许改回 JSON 向量列；成员消息在休息时段也学习，机器人画像只在正常 AI 回答成功发送后学习。
 
 ## 6. 作息、问候和提醒边界
 
-- 工作窗口按配置分钟数判断，开始时刻包含、结束时刻排除；窗口外即使被 @ 也不回答。
+- 工作窗口按配置分钟数判断，开始时刻包含、结束时刻排除；窗口外即使被 @ 也不回答，但白名单群文字会更新发言画像。
 - 早安在当天首次进入工作窗口时发送一次；晚安只在结束后的 10 分钟内发送一次。SQLite 防止重连重复发送。
 - 最近群聊默认 300 秒、最多 20 条、每条 300 字；流量评分使用独立窗口，不能因修改群聊上下文时间而改变统计语义。
 - 逐成员对话默认最多 10 条消息、闲置 30 分钟过期；TTL 为 0 时只按条数限制。
@@ -117,5 +124,5 @@ cd D:\codex\qqrobot
 - QQ 客户端：`D:\Program Files\Tencent\QQNT\QQ.exe`；NapCat 本地目录为被忽略的 `qq/`。
 - OneBot 默认地址：`ws://127.0.0.1:3001`，消息格式必须为数组；Access Token 两端配置必须一致。
 - 日志显示“已同步群 … 的 0 名成员”时，先确认机器人账号确实在该群；当前版本会跳过 `get_group_list` 中不存在的白名单群。
-- @无回复时依次检查：群是否在白名单、机器人是否仍在群、当前是否处于工作窗口、NapCat 是否持续运行、DeepSeek Key/余额及模型名是否有效。
+- @无回复可能是正常概率结果；排障时再依次检查群白名单、机器人是否仍在群、工作窗口、NapCat、DeepSeek Key/余额及模型名。
 - 启动后没有持续日志通常表示正在等待消息，不代表程序卡死。

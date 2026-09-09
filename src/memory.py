@@ -93,6 +93,52 @@ class MemoryStore:
                 last_bot_sent_at REAL,
                 PRIMARY KEY (group_id, local_date)
             );
+
+            -- 成员画像主表只保存标量；兴趣向量拆到子表，避免 JSON 黑盒字段。
+            CREATE TABLE IF NOT EXISTS speech_member_profiles (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                activity_value REAL NOT NULL DEFAULT 0,
+                activity_updated_at REAL NOT NULL DEFAULT 0,
+                bond_value REAL NOT NULL DEFAULT 0,
+                bond_updated_at REAL NOT NULL DEFAULT 0,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (group_id, user_id)
+            );
+
+            -- 稀疏向量只保存非零维度，联合主键保证 UPSERT 可原子合并。
+            CREATE TABLE IF NOT EXISTS speech_member_features (
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                feature_id INTEGER NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (group_id, user_id, feature_id),
+                FOREIGN KEY (group_id, user_id)
+                    REFERENCES speech_member_profiles(group_id, user_id)
+                    ON DELETE CASCADE
+            );
+
+            -- 机器人话题画像按群隔离，防止不同群的聊天偏好相互污染。
+            CREATE TABLE IF NOT EXISTS speech_bot_profiles (
+                group_id TEXT PRIMARY KEY,
+                reply_count INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0
+            );
+
+            -- 机器人兴趣同样按“一维一行”保存，可直接用 SQL 查询和增量更新。
+            CREATE TABLE IF NOT EXISTS speech_bot_features (
+                group_id TEXT NOT NULL,
+                feature_id INTEGER NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (group_id, feature_id),
+                FOREIGN KEY (group_id) REFERENCES speech_bot_profiles(group_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_speech_member_profiles_updated
+                ON speech_member_profiles(group_id, updated_at);
             """
         )
         activity_columns = {
@@ -438,3 +484,211 @@ class MemoryStore:
             (str(group_id), str(user_id)),
         ).fetchone()
         return int(row["count"])
+
+    @staticmethod
+    def _decay(value: float, updated_at: float, now: float, half_life_seconds: float) -> float:
+        """按半衰期衰减长期数值；读取和写入都使用同一时间语义。"""
+        if value <= 0 or updated_at <= 0 or now <= updated_at:
+            return max(0.0, float(value))
+        return float(value) * 0.5 ** ((now - updated_at) / half_life_seconds)
+
+    def _member_features(self, group_id: str, user_id: str) -> dict[int, float]:
+        """通过联合索引读取单个成员的全部非零兴趣维度。"""
+        rows = self.conn.execute(
+            """SELECT feature_id, value FROM speech_member_features
+               WHERE group_id=? AND user_id=?""",
+            (group_id, user_id),
+        ).fetchall()
+        return {int(row["feature_id"]): float(row["value"]) for row in rows}
+
+    def _bot_features(self, group_id: str) -> dict[int, float]:
+        """读取机器人在指定群内学习到的稀疏话题向量。"""
+        rows = self.conn.execute(
+            "SELECT feature_id, value FROM speech_bot_features WHERE group_id=?",
+            (group_id,),
+        ).fetchall()
+        return {int(row["feature_id"]): float(row["value"]) for row in rows}
+
+    def get_speech_profiles(
+        self,
+        group_id: str | int,
+        user_id: str | int,
+        now: float,
+        *,
+        activity_half_life_seconds: float,
+        bond_half_life_seconds: float,
+    ) -> tuple[dict, dict]:
+        """读取发言者和机器人画像，并按读取时刻计算衰减值。"""
+        gid, uid = str(group_id), str(user_id)
+        # 主表和特征表分开读取，让 SQL schema 保持规范化且便于独立索引。
+        row = self.conn.execute(
+            "SELECT * FROM speech_member_profiles WHERE group_id=? AND user_id=?",
+            (gid, uid),
+        ).fetchone()
+        if row:
+            member = dict(row)
+            member["activity_value"] = self._decay(
+                member["activity_value"],
+                member["activity_updated_at"],
+                now,
+                activity_half_life_seconds,
+            )
+            member["bond_value"] = self._decay(
+                member["bond_value"],
+                member["bond_updated_at"],
+                now,
+                bond_half_life_seconds,
+            )
+            member["features"] = self._member_features(gid, uid)
+        else:
+            member = {
+                "activity_value": 0.0,
+                "bond_value": 0.0,
+                "message_count": 0,
+                "reply_count": 0,
+                "features": {},
+            }
+        bot_row = self.conn.execute(
+            "SELECT * FROM speech_bot_profiles WHERE group_id=?", (gid,)
+        ).fetchone()
+        bot = dict(bot_row) if bot_row else {"reply_count": 0, "updated_at": 0.0}
+        bot["features"] = self._bot_features(gid) if bot_row else {}
+        return member, bot
+
+    @staticmethod
+    def _update_sparse_features(
+        connection: sqlite3.Connection,
+        table: str,
+        keys: tuple,
+        features: dict[int, float],
+        learning_rate: float,
+    ) -> None:
+        """在当前事务中用 EMA 更新一组规范化稀疏特征行。"""
+        # 表名只能来自本类内部的两个固定调用点，不接受任何外部输入。
+        where_columns = (
+            "group_id=? AND user_id=?" if table == "speech_member_features" else "group_id=?"
+        )
+        # 先整体衰减旧向量，连本次消息未出现的维度也必须降低权重。
+        connection.execute(
+            f"UPDATE {table} SET value=value*? WHERE {where_columns}",
+            (1.0 - learning_rate, *keys),
+        )
+        if table == "speech_member_features":
+            sql = """INSERT INTO speech_member_features(group_id, user_id, feature_id, value)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT(group_id, user_id, feature_id) DO UPDATE SET
+                         value=speech_member_features.value+excluded.value"""
+        else:
+            sql = """INSERT INTO speech_bot_features(group_id, feature_id, value)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(group_id, feature_id) DO UPDATE SET
+                         value=speech_bot_features.value+excluded.value"""
+        # 再批量 UPSERT 本次非零特征；整个过程由调用方事务包裹。
+        connection.executemany(
+            sql,
+            [(*keys, feature_id, learning_rate * value) for feature_id, value in features.items()],
+        )
+        # 删除接近零的行，长期运行时数据库不会积累无意义的微小维度。
+        connection.execute(
+            f"DELETE FROM {table} WHERE {where_columns} AND ABS(value)<1e-9", keys
+        )
+
+    def observe_speech_message(
+        self,
+        group_id: str | int,
+        user_id: str | int,
+        now: float,
+        features: dict[int, float],
+        *,
+        activity_half_life_seconds: float,
+        interest_learning_rate: float,
+    ) -> None:
+        """事务化记录一条成员文字消息及其稀疏兴趣特征。"""
+        gid, uid = str(group_id), str(user_id)
+        row = self.conn.execute(
+            "SELECT activity_value, activity_updated_at FROM speech_member_profiles "
+            "WHERE group_id=? AND user_id=?",
+            (gid, uid),
+        ).fetchone()
+        # 新消息贡献 1；旧活跃值先按距上次消息的时间做半衰期衰减。
+        activity = 1.0
+        if row:
+            activity += self._decay(
+                row["activity_value"], row["activity_updated_at"], now, activity_half_life_seconds
+            )
+        # 主表计数和子表向量必须同时成功或同时回滚。
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO speech_member_profiles
+                       (group_id, user_id, activity_value, activity_updated_at,
+                        bond_updated_at, message_count, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(group_id, user_id) DO UPDATE SET
+                       activity_value=excluded.activity_value,
+                       activity_updated_at=excluded.activity_updated_at,
+                       message_count=speech_member_profiles.message_count+1,
+                       updated_at=excluded.updated_at""",
+                (gid, uid, activity, now, now, now),
+            )
+            self._update_sparse_features(
+                self.conn,
+                "speech_member_features",
+                (gid, uid),
+                features,
+                interest_learning_rate,
+            )
+
+    def record_speech_reply(
+        self,
+        group_id: str | int,
+        user_id: str | int,
+        now: float,
+        features: dict[int, float],
+        *,
+        bond_half_life_seconds: float,
+        bond_learning_rate: float,
+        interest_learning_rate: float,
+    ) -> None:
+        """事务化强化成员关系，并更新机器人在该群参与过的话题。"""
+        gid, uid = str(group_id), str(user_id)
+        row = self.conn.execute(
+            "SELECT bond_value, bond_updated_at FROM speech_member_profiles "
+            "WHERE group_id=? AND user_id=?",
+            (gid, uid),
+        ).fetchone()
+        bond = 0.0
+        if row:
+            bond = self._decay(
+                row["bond_value"], row["bond_updated_at"], now, bond_half_life_seconds
+            )
+        # 每次成功回答把关系值向 1 拉近，避免线性累加突破合法范围。
+        bond += (1.0 - bond) * bond_learning_rate
+        # 成员关系、机器人计数和机器人话题向量组成一个不可分割的事务。
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO speech_member_profiles
+                       (group_id, user_id, activity_updated_at, bond_value,
+                        bond_updated_at, reply_count, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 1, ?)
+                   ON CONFLICT(group_id, user_id) DO UPDATE SET
+                       bond_value=excluded.bond_value,
+                       bond_updated_at=excluded.bond_updated_at,
+                       reply_count=speech_member_profiles.reply_count+1,
+                       updated_at=excluded.updated_at""",
+                (gid, uid, now, bond, now, now),
+            )
+            self.conn.execute(
+                """INSERT INTO speech_bot_profiles(group_id, reply_count, updated_at)
+                   VALUES (?, 1, ?)
+                   ON CONFLICT(group_id) DO UPDATE SET
+                       reply_count=speech_bot_profiles.reply_count+1,
+                       updated_at=excluded.updated_at""",
+                (gid, now),
+            )
+            self._update_sparse_features(
+                self.conn,
+                "speech_bot_features",
+                (gid,),
+                features,
+                interest_learning_rate,
+            )

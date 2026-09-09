@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import random
 import re
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta
 from html import unescape
 from pathlib import Path
@@ -43,6 +44,7 @@ DEFAULT_EMPTY_REPLY = "请在 @ 我后输入想聊的内容。"
 DEFAULT_DB_PATH = "data/bot_memory.sqlite3"
 DEFAULT_ERROR_LOG_PATH = "logs/error_context.txt"
 ENV_FILE = Path(".env")
+SPEECH_VECTOR_DIMENSIONS = 128
 
 MORNING_MESSAGES = (
     "早上好，我睡醒啦，今天也来和大家一起聊天。",
@@ -63,11 +65,16 @@ _DATE_CUE_PATTERN = re.compile(
     r"今天|明天|后天|大后天|本周|这周|下周|星期|礼拜|周[一二三四五六日天]|"
     r"早上|上午|中午|下午|晚上|凌晨|\d{1,2}[:：点时]|截止|到期)"
 )
-_FORCED_WEB_SEARCH_PATTERN = re.compile(
+_EXPLICIT_WEB_SEARCH_PATTERN = re.compile(
     r"(?:联网|上网|网络)(?:搜索|查找|查询|查一下|搜一下)|"
-    r"(?:搜索|查找|查询|查一下|搜一下)(?:网络|网上|一下)?|"
-    r"(?:现在|当前|此刻|当地|北京).{0,8}(?:几点|时间)|"
-    r"(?:几点了|现在几点|当前时间|北京时间|当地时间)"
+    r"(?:搜索|查找|查询|查一下|搜一下)(?:网络|网上|一下)?"
+)
+_LOCAL_TIME_QUESTION_PATTERN = re.compile(
+    r"^\s*(?:(?:请问|你知道|告诉我|机器人)[，,：:\s]*)?"
+    r"(?:(?:现在|当前|此刻|当地|北京)(?:是)?"
+    r"(?:几点(?:钟)?(?:了)?|时间(?:是)?(?:多少)?)|"
+    r"(?:几点了|当前时间|北京时间|当地时间))"
+    r"(?:吗|呢)?[?？!！。]*\s*$"
 )
 _QQ_NUMBER_PATTERN = re.compile(r"QQ\s*\d+", re.IGNORECASE)
 _LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
@@ -235,23 +242,129 @@ def _format_time(minutes: int) -> str:
     return "24:00" if minutes == 1440 else f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
+# ==================== 本地文本特征与概率模型 ====================
+# 这些函数不调用外部模型，保证每条群消息的判定快速、免费且可重复测试。
+
+
+def text_feature_vector(text: str) -> dict[int, float]:
+    """把文本转换成稳定、稀疏且已归一化的字符二元组向量。"""
+    # 去掉标点和空白，避免“你好！”和“你好”因格式不同落入完全不同的话题。
+    normalized = "".join(re.findall(r"[\w\u4e00-\u9fff]", text.casefold()))
+    if not normalized:
+        return {}
+    tokens = (
+        [normalized]
+        if len(normalized) == 1
+        else [normalized[index : index + 2] for index in range(len(normalized) - 1)]
+    )
+    counts: dict[int, float] = defaultdict(float)
+    # BLAKE2b 在不同进程中的结果稳定；不能使用 Python hash()，后者每次启动会变。
+    for token in tokens:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        counts[int.from_bytes(digest, "big") % SPEECH_VECTOR_DIMENSIONS] += 1.0
+    # L2 归一化后，余弦相似度只反映方向，不受消息长度直接支配。
+    norm = math.sqrt(sum(value * value for value in counts.values()))
+    return {feature_id: value / norm for feature_id, value in counts.items()}
+
+
+def cosine_similarity(left: dict[int, float], right: dict[int, float]) -> float:
+    """只遍历较稀疏的一侧，计算两个 SQL 稀疏向量的余弦相似度。"""
+    if not left or not right:
+        return 0.0
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if not left_norm or not right_norm:
+        return 0.0
+    smaller, larger = (left, right) if len(left) <= len(right) else (right, left)
+    dot = sum(value * larger.get(key, 0.0) for key, value in smaller.items())
+    return min(1.0, max(0.0, dot / (left_norm * right_norm)))
+
+
+def average_vectors(vectors: list[dict[int, float]]) -> dict[int, float]:
+    """合并近期消息向量，形成当前群聊话题中心。"""
+    populated = [vector for vector in vectors if vector]
+    if not populated:
+        return {}
+    result: dict[int, float] = defaultdict(float)
+    for vector in populated:
+        for feature_id, value in vector.items():
+            result[feature_id] += value / len(populated)
+    return dict(result)
+
+
+def stable_sigmoid(value: float) -> float:
+    """限制指数输入，避免极端配置导致 exp() 数值溢出。"""
+    value = min(60.0, max(-60.0, value))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+@dataclass(frozen=True)
+class SpeechFeatures:
+    """一次发言决策使用的八项基础特征，所有值都位于 0–1。"""
+    user_activity: float
+    group_activity: float
+    topic_familiarity: float
+    social_bond: float
+    is_mentioned: float
+    message_relevance: float
+    fun_factor: float
+    random_noise: float
+
+
+@dataclass(frozen=True)
+class SpeechDecision:
+    """保留概率和原始分，便于测试与 DEBUG 日志解释决策。"""
+    accepted: bool
+    probability: float
+    raw_score: float
+    features: SpeechFeatures | None = None
+    reason: str = ""
+
+
 @dataclass(frozen=True)
 class BotConfig:
+    """机器人全部运行参数；``from_env`` 是生产环境唯一的配置入口。"""
+
+    # 群范围与作息决定消息是否有资格进入回复流程。
     active_group_ids: frozenset[str]
     timezone: ZoneInfo
     answer_start_minutes: int = 600
     answer_end_minutes: int = 1140
+
+    # 普通消息的硬限制只约束机器人主动插话；被 @ 的消息不受这些限制。
     spontaneous_replies_enabled: bool = True
     spontaneous_daily_min: int = 60
     spontaneous_daily_max: int = 100
     spontaneous_min_interval_seconds: int = 600
-    spontaneous_score_threshold: float = 0.65
-    spontaneous_random_weight: float = 0.40
-    spontaneous_traffic_weight: float = 0.25
-    spontaneous_silence_weight: float = 0.35
     spontaneous_traffic_window_seconds: int = 60
     spontaneous_traffic_full_score_messages: int = 10
-    spontaneous_silence_full_score_seconds: int = 1200
+
+    # 以下十个权重逐项对应 SpeechFeatures 及两个交互项，允许在 .env 调参。
+    speak_weight_user_activity: float = 0.08
+    speak_weight_group_activity: float = 0.08
+    speak_weight_topic_familiarity: float = 0.12
+    speak_weight_social_bond: float = 0.12
+    speak_weight_is_mentioned: float = 1.0
+    speak_weight_message_relevance: float = 0.12
+    speak_weight_fun_factor: float = 0.08
+    speak_weight_random_noise: float = 0.05
+    speak_weight_interaction_mentioned_topic: float = 0.15
+    speak_weight_interaction_user_group_activity: float = 0.05
+
+    # Sigmoid 参数控制原始分到概率的曲线陡峭程度和中心位置。
+    speak_sigmoid_k: float = 6.0
+    speak_sigmoid_midpoint: float = 0.65
+
+    # 画像尺度、半衰期和学习率控制长期记忆如何随消息变化。
+    speak_user_activity_full_score_messages: int = 20
+    speak_activity_half_life_hours: float = 24.0
+    speak_bond_half_life_days: float = 30.0
+    speak_bond_learning_rate: float = 0.10
+    speak_interest_learning_rate: float = 0.20
+    speak_recent_reply_window_seconds: int = 600
+    speak_recent_reply_full_count: int = 5
+
+    # 其余字段分别控制成员同步、未来事项、上下文、问候、API 和错误日志。
     member_sync_interval_seconds: int = 21600
     member_context_match_limit: int = 20
     future_memory_enabled: bool = True
@@ -290,6 +403,8 @@ class BotConfig:
 
     @classmethod
     def from_env(cls) -> "BotConfig":
+        """严格解析环境变量；任何非法值都在连接 NapCat 前终止启动。"""
+        # 空白名单是合法的“完全静默”模式；非空值必须都是十进制群号。
         group_ids = frozenset(
             value.strip()
             for value in (os.getenv("ACTIVE_GROUP_IDS") or "").split(",")
@@ -316,11 +431,6 @@ class BotConfig:
         daily_max = _env_int("SPONTANEOUS_DAILY_MAX", 100, minimum=0)
         if daily_max < daily_min:
             raise ConfigError("SPONTANEOUS_DAILY_MAX 不能小于 SPONTANEOUS_DAILY_MIN")
-        random_weight = _env_float("SPONTANEOUS_RANDOM_WEIGHT", 0.40, minimum=0)
-        traffic_weight = _env_float("SPONTANEOUS_TRAFFIC_WEIGHT", 0.25, minimum=0)
-        silence_weight = _env_float("SPONTANEOUS_SILENCE_WEIGHT", 0.35, minimum=0)
-        if abs(random_weight + traffic_weight + silence_weight - 1.0) > 1e-6:
-            raise ConfigError("三个 SPONTANEOUS_*_WEIGHT 之和必须等于 1")
         followup_min = _env_int("REMINDER_FOLLOWUP_MIN_MINUTES", 120, minimum=0)
         followup_max = _env_int("REMINDER_FOLLOWUP_MAX_MINUTES", 300, minimum=0)
         if followup_max < followup_min:
@@ -333,6 +443,8 @@ class BotConfig:
         error_log_path = (os.getenv("ERROR_LOG_PATH") or DEFAULT_ERROR_LOG_PATH).strip()
         if not error_log_path:
             raise ConfigError("ERROR_LOG_PATH 不能为空")
+
+        # 所有 SPEAK_* 参数也复用严格解析器，不允许拼写错误后静默回退。
         return cls(
             active_group_ids=group_ids,
             timezone=timezone,
@@ -344,20 +456,64 @@ class BotConfig:
             spontaneous_min_interval_seconds=_env_int(
                 "SPONTANEOUS_MIN_INTERVAL_SECONDS", 600, minimum=0
             ),
-            spontaneous_score_threshold=_env_float(
-                "SPONTANEOUS_SCORE_THRESHOLD", 0.65, minimum=0, maximum=1
-            ),
-            spontaneous_random_weight=random_weight,
-            spontaneous_traffic_weight=traffic_weight,
-            spontaneous_silence_weight=silence_weight,
             spontaneous_traffic_window_seconds=_env_int(
                 "SPONTANEOUS_TRAFFIC_WINDOW_SECONDS", 60, minimum=1
             ),
             spontaneous_traffic_full_score_messages=_env_int(
                 "SPONTANEOUS_TRAFFIC_FULL_SCORE_MESSAGES", 10, minimum=1
             ),
-            spontaneous_silence_full_score_seconds=_env_int(
-                "SPONTANEOUS_SILENCE_FULL_SCORE_SECONDS", 1200, minimum=1
+            speak_weight_user_activity=_env_float(
+                "SPEAK_WEIGHT_USER_ACTIVITY", 0.08, minimum=0
+            ),
+            speak_weight_group_activity=_env_float(
+                "SPEAK_WEIGHT_GROUP_ACTIVITY", 0.08, minimum=0
+            ),
+            speak_weight_topic_familiarity=_env_float(
+                "SPEAK_WEIGHT_TOPIC_FAMILIARITY", 0.12, minimum=0
+            ),
+            speak_weight_social_bond=_env_float(
+                "SPEAK_WEIGHT_SOCIAL_BOND", 0.12, minimum=0
+            ),
+            speak_weight_is_mentioned=_env_float(
+                "SPEAK_WEIGHT_IS_MENTIONED", 1.0, minimum=0
+            ),
+            speak_weight_message_relevance=_env_float(
+                "SPEAK_WEIGHT_MESSAGE_RELEVANCE", 0.12, minimum=0
+            ),
+            speak_weight_fun_factor=_env_float(
+                "SPEAK_WEIGHT_FUN_FACTOR", 0.08, minimum=0
+            ),
+            speak_weight_random_noise=_env_float(
+                "SPEAK_WEIGHT_RANDOM_NOISE", 0.05, minimum=0
+            ),
+            speak_weight_interaction_mentioned_topic=_env_float(
+                "SPEAK_WEIGHT_INTERACTION_MENTIONED_TOPIC", 0.15, minimum=0
+            ),
+            speak_weight_interaction_user_group_activity=_env_float(
+                "SPEAK_WEIGHT_INTERACTION_USER_GROUP_ACTIVITY", 0.05, minimum=0
+            ),
+            speak_sigmoid_k=_env_float("SPEAK_SIGMOID_K", 6.0, minimum=0.01),
+            speak_sigmoid_midpoint=_env_float("SPEAK_SIGMOID_MIDPOINT", 0.65),
+            speak_user_activity_full_score_messages=_env_int(
+                "SPEAK_USER_ACTIVITY_FULL_SCORE_MESSAGES", 20, minimum=1
+            ),
+            speak_activity_half_life_hours=_env_float(
+                "SPEAK_ACTIVITY_HALF_LIFE_HOURS", 24.0, minimum=0.01
+            ),
+            speak_bond_half_life_days=_env_float(
+                "SPEAK_BOND_HALF_LIFE_DAYS", 30.0, minimum=0.01
+            ),
+            speak_bond_learning_rate=_env_float(
+                "SPEAK_BOND_LEARNING_RATE", 0.10, minimum=0, maximum=1
+            ),
+            speak_interest_learning_rate=_env_float(
+                "SPEAK_INTEREST_LEARNING_RATE", 0.20, minimum=0, maximum=1
+            ),
+            speak_recent_reply_window_seconds=_env_int(
+                "SPEAK_RECENT_REPLY_WINDOW_SECONDS", 600, minimum=1
+            ),
+            speak_recent_reply_full_count=_env_int(
+                "SPEAK_RECENT_REPLY_FULL_COUNT", 5, minimum=1
             ),
             member_sync_interval_seconds=_env_int(
                 "MEMBER_SYNC_INTERVAL_SECONDS", 21600, minimum=60
@@ -505,6 +661,11 @@ class DeepSeekClient:
         context: str = "",
         now: datetime | None = None,
     ) -> str:
+        # “现在几点”只依赖机器人已经持有的带时区本地时钟，无需联网核验。
+        # 直接本地回答还能避免模型未调用 web_search 时被错误判定为联网失败。
+        if now is not None and _LOCAL_TIME_QUESTION_PATTERN.search(user_text):
+            timezone_name = getattr(now.tzinfo, "key", None) or now.tzname() or "本地时区"
+            return f"现在是 {now:%Y年%m月%d日 %H:%M}（{timezone_name}）。"
         if self.web_search_enabled:
             try:
                 return await self._chat_with_web(history, user_text, context=context, now=now)
@@ -571,7 +732,8 @@ class DeepSeekClient:
             if item.get("role") in {"user", "assistant"} and item.get("content")
         )
         input_items.append({"role": "user", "content": safe_user_text})
-        force_search = bool(_FORCED_WEB_SEARCH_PATTERN.search(user_text))
+        # 只有用户明确要求联网/搜索时才强制工具调用；本地时间问题已在 chat() 返回。
+        force_search = bool(_EXPLICIT_WEB_SEARCH_PATTERN.search(user_text))
         body = {
             "model": self.model,
             "instructions": instructions,
@@ -794,6 +956,7 @@ class QQBot:
             self.config.future_extraction_concurrency
         )
         self._recent_messages: defaultdict[str, deque] = defaultdict(deque)
+        self._recent_bot_replies: defaultdict[str, deque] = defaultdict(deque)
         self._refresh_tasks: dict[str, asyncio.Task] = {}
         # 白名单只是用户授权范围；实际发送前还必须由 get_group_list 或群事件
         # 确认机器人当前确实在群内，防止对尚未加入/已被移出的群反复发送。
@@ -933,45 +1096,89 @@ class QQBot:
             now = self.now()
             self.memory.acknowledge_user(group_id, user_id, now.timestamp())
             text_value = extract_message_text(payload)
-            if text_value:
-                self._remember_recent(group_id, user_id, text_value, payload, now)
+            mentioned = is_at_self(payload, self_id)
+            # 无文字且未 @ 的图片/表情不具备可计算语义，直接忽略。
+            if not text_value and not mentioned:
+                self._log_speech_decision(
+                    group_id,
+                    user_id,
+                    mentioned,
+                    SpeechDecision(False, 0.0, 0.0, reason="没有可评分的文字内容"),
+                )
+                return
             if not self.is_answer_time(now):
+                # 即使没有进入概率模型，也记录这次不发言及其明确原因。
+                self._log_speech_decision(
+                    group_id,
+                    user_id,
+                    mentioned,
+                    SpeechDecision(False, 0.0, 0.0, reason="工作时段外"),
+                )
+                # 休息时段不发言，但持续学习，避免每天开机后画像重新冷启动。
+                if text_value:
+                    self._observe_speech_message(group_id, user_id, text_value, now)
+                    self._remember_recent(group_id, user_id, text_value, payload, now)
                 return
 
-            mentioned = is_at_self(payload, self_id)
-            spontaneous = False
             should_reply = False
-            # 同一群的“评分 -> 回复 -> 计数”必须串行，否则繁忙群可能多条消息
-            # 同时看到旧的最后发言时间并一起越过配置的最小间隔。
+            responded = False
+            # 评分、发送、计数和画像强化必须在同一个群锁内保持顺序一致。
             async with self._group_reply_locks[group_id]:
-                if mentioned:
-                    should_reply = True
-                elif text_value:
-                    should_reply = self._should_reply_spontaneously(group_id, now)
-                    spontaneous = should_reply
+                try:
+                    decision = self._decide_speech(
+                        group_id, user_id, text_value, mentioned, now
+                    )
+                    # 在调用 DeepSeek 前输出算法结果，后端能实时看到每条消息的判定。
+                    self._log_speech_decision(
+                        group_id, user_id, mentioned, decision
+                    )
+                    should_reply = decision.accepted
+                    spontaneous = should_reply and not mentioned
 
-                if mentioned and not text_value:
-                    await self._send_group_message(
-                        ws, group_id, self.config.empty_reply, pending, now=now
-                    )
-                elif should_reply and text_value:
-                    await self._answer_message(
-                        ws,
-                        payload,
-                        pending,
-                        text_value,
-                        group_id,
-                        user_id,
-                        self_id,
-                        now,
-                        spontaneous,
-                    )
+                    if should_reply and mentioned and not text_value:
+                        await self._send_group_message(
+                            ws, group_id, self.config.empty_reply, pending, now=now
+                        )
+                        responded = True
+                    elif should_reply and text_value:
+                        responded = await self._answer_message(
+                            ws,
+                            payload,
+                            pending,
+                            text_value,
+                            group_id,
+                            user_id,
+                            self_id,
+                            now,
+                            spontaneous,
+                        )
+
+                    feature_vector = text_feature_vector(text_value)
+                    # 只有用户真正收到正常回答（或空 @ 引导）才强化双方关系。
+                    if responded:
+                        self.memory.record_speech_reply(
+                            group_id,
+                            user_id,
+                            now.timestamp(),
+                            feature_vector,
+                            bond_half_life_seconds=(
+                                self.config.speak_bond_half_life_days * 86400
+                            ),
+                            bond_learning_rate=self.config.speak_bond_learning_rate,
+                            interest_learning_rate=self.config.speak_interest_learning_rate,
+                        )
+                finally:
+                    if text_value:
+                        # 当前消息在评分完成后才写入画像，防止与自身比较得到虚假的满相关。
+                        # 即使 DeepSeek 或 QQ 发送失败也学习这条用户消息。
+                        self._observe_speech_message(group_id, user_id, text_value, now)
+                        self._remember_recent(group_id, user_id, text_value, payload, now)
 
             # active_window_all：回答时段内所有候选消息都提取未来事项。
             # participated：仅从机器人实际参与回复的消息中提取。通过 .env 切换，无需改源码。
             should_extract = self.config.future_memory_enabled and text_value and (
                 self.config.future_memory_source == "active_window_all"
-                or (self.config.future_memory_source == "participated" and should_reply)
+                or (self.config.future_memory_source == "participated" and responded)
             )
             if should_extract and _DATE_CUE_PATTERN.search(text_value):
                 await self._extract_and_store_future_events(payload, text_value, now)
@@ -989,12 +1196,12 @@ class QQBot:
         self_id: str,
         now: datetime,
         spontaneous: bool,
-    ) -> None:
+    ) -> bool:
         if self.llm_client is None:
             await self._send_group_message(
                 ws, group_id, self.config.error_reply, pending, now=now, spontaneous=spontaneous
             )
-            return
+            return False
         conversation_id = (group_id, user_id)
         async with self._conversation_locks[conversation_id]:
             self._prune_expired_histories(now)
@@ -1016,13 +1223,16 @@ class QQBot:
                     now=now,
                     spontaneous=spontaneous,
                 )
-                return
+                return False
             except Exception:  # noqa: BLE001
                 logger.exception("调用 DeepSeek 失败")
                 await self._send_group_message(
                     ws, group_id, self.config.error_reply, pending, now=now, spontaneous=spontaneous
                 )
-                return
+                return False
+            await self._send_group_message(
+                ws, group_id, answer, pending, now=now, spontaneous=spontaneous
+            )
             updated = history + [
                 {"role": "user", "content": question},
                 {"role": "assistant", "content": answer},
@@ -1035,9 +1245,7 @@ class QQBot:
             else:
                 self._histories.pop(conversation_id, None)
                 self._history_last_active.pop(conversation_id, None)
-            await self._send_group_message(
-                ws, group_id, answer, pending, now=now, spontaneous=spontaneous
-            )
+            return True
 
     def _prune_expired_histories(self, now: datetime) -> None:
         ttl_seconds = self.config.chat_history_ttl_minutes * 60
@@ -1079,49 +1287,253 @@ class QQBot:
         while len(queue) > storage_limit:
             queue.popleft()
 
-    def _should_reply_spontaneously(self, group_id: str, now: datetime) -> bool:
-        if not self.config.spontaneous_replies_enabled:
-            return False
-        activity = self.memory.get_activity(group_id, now.date().isoformat())
-        daily_limit = self.memory.ensure_daily_spontaneous_limit(
+    def _observe_speech_message(
+        self, group_id: str, user_id: str, text_value: str, now: datetime
+    ) -> None:
+        """把当前成员消息交给 SQLite 事务更新长期画像。"""
+        self.memory.observe_speech_message(
             group_id,
-            now.date().isoformat(),
-            self.config.spontaneous_daily_min,
-            self.config.spontaneous_daily_max,
-            self.rng.randint(
+            user_id,
+            now.timestamp(),
+            text_feature_vector(text_value),
+            activity_half_life_seconds=(
+                self.config.speak_activity_half_life_hours * 3600
+            ),
+            interest_learning_rate=self.config.speak_interest_learning_rate,
+        )
+
+    def _recent_topic_vector(self, group_id: str, now: datetime) -> dict[int, float]:
+        """从当前消息之前的内存群聊生成短期话题向量。"""
+        cutoff = now.timestamp() - self.config.group_context_window_seconds
+        vectors = [
+            text_feature_vector(text_value)
+            for sent_at, _, _, text_value in self._recent_messages[group_id]
+            if sent_at >= cutoff
+        ]
+        return average_vectors(vectors)
+
+    def _fun_factor(self, group_id: str, text_value: str, now: datetime) -> float:
+        """估算消息的对话性，并在机器人近期话太多时主动降权。"""
+        # 疑问/感叹、幽默标记和适合聊天的长度分别贡献一部分内容分。
+        question = 1.0 if re.search(r"[?？!！]", text_value) else 0.0
+        humor = 1.0 if re.search(r"哈哈|笑死|233|草|绷不住|😂|🤣", text_value) else 0.0
+        length = len(text_value.strip())
+        length_score = 1.0 if 4 <= length <= 80 else (0.5 if 1 <= length <= 200 else 0.0)
+        content_score = 0.35 * question + 0.35 * humor + 0.30 * length_score
+
+        # 只保留配置窗口内的机器人发言，避免历史队列无限增长。
+        queue = self._recent_bot_replies[group_id]
+        cutoff = now.timestamp() - self.config.speak_recent_reply_window_seconds
+        while queue and queue[0] < cutoff:
+            queue.popleft()
+        saturation = min(
+            len(queue) / self.config.speak_recent_reply_full_count, 1.0
+        )
+        return content_score * (1.0 - 0.5 * saturation)
+
+    def _decide_speech(
+        self,
+        group_id: str,
+        user_id: str,
+        text_value: str,
+        mentioned: bool,
+        now: datetime,
+    ) -> SpeechDecision:
+        """对所有候选消息计算发言概率；@ 只豁免主动回复限额。"""
+        if not mentioned:
+            # 每日上限和最小间隔仅保护普通主动插话；@ 消息直接进入概率模型。
+            if not self.config.spontaneous_replies_enabled:
+                return SpeechDecision(False, 0.0, 0.0, reason="主动回复已关闭")
+            activity = self.memory.get_activity(group_id, now.date().isoformat())
+            daily_limit = self.memory.ensure_daily_spontaneous_limit(
+                group_id,
+                now.date().isoformat(),
                 self.config.spontaneous_daily_min,
                 self.config.spontaneous_daily_max,
+                self.rng.randint(
+                    self.config.spontaneous_daily_min,
+                    self.config.spontaneous_daily_max,
+                ),
+            )
+            if activity["spontaneous_count"] >= daily_limit:
+                return SpeechDecision(False, 0.0, 0.0, reason="达到每日上限")
+            last_sent = activity["last_bot_sent_at"]
+            if (
+                last_sent is not None
+                and now.timestamp() - last_sent
+                < self.config.spontaneous_min_interval_seconds
+            ):
+                return SpeechDecision(False, 0.0, 0.0, reason="未达到最小间隔")
+
+        # 所有画像都在当前消息写入前读取，确保特征没有数据泄漏。
+        current_vector = text_feature_vector(text_value)
+        member, bot = self.memory.get_speech_profiles(
+            group_id,
+            user_id,
+            now.timestamp(),
+            activity_half_life_seconds=(
+                self.config.speak_activity_half_life_hours * 3600
             ),
+            bond_half_life_seconds=self.config.speak_bond_half_life_days * 86400,
         )
-        if activity["spontaneous_count"] >= daily_limit:
-            return False
-        last_sent = activity["last_bot_sent_at"]
-        silence = float("inf") if last_sent is None else max(0.0, now.timestamp() - last_sent)
-        if silence < self.config.spontaneous_min_interval_seconds:
-            return False
+        # 1-exp(-x/scale) 把无上限的衰减消息量平滑压缩到 0–1。
+        user_activity = 1.0 - math.exp(
+            -member["activity_value"]
+            / self.config.speak_user_activity_full_score_messages
+        )
         traffic_cutoff = now.timestamp() - self.config.spontaneous_traffic_window_seconds
-        message_count = sum(
+        message_count = 1 + sum(
             1 for sent_at, *_ in self._recent_messages[group_id] if sent_at >= traffic_cutoff
         )
-        traffic_score = min(
+        group_activity = min(
             message_count / self.config.spontaneous_traffic_full_score_messages, 1.0
         )
-        silence_score = min(
-            silence / self.config.spontaneous_silence_full_score_seconds, 1.0
+        # 话题熟悉度同时考虑发言者长期兴趣和机器人在本群参与过的话题。
+        familiarity_values = [
+            cosine_similarity(current_vector, member["features"]),
+            cosine_similarity(current_vector, bot["features"]),
+        ]
+        populated_familiarities = [
+            value
+            for value, vector in zip(
+                familiarity_values, (member["features"], bot["features"])
+            )
+            if vector
+        ]
+        topic_familiarity = (
+            sum(populated_familiarities) / len(populated_familiarities)
+            if populated_familiarities
+            else 0.0
         )
-        score = (
-            self.config.spontaneous_random_weight * self.rng.random()
-            + self.config.spontaneous_traffic_weight * traffic_score
-            + self.config.spontaneous_silence_weight * silence_score
+        message_relevance = cosine_similarity(
+            current_vector, self._recent_topic_vector(group_id, now)
         )
+        features = SpeechFeatures(
+            user_activity=user_activity,
+            group_activity=group_activity,
+            topic_familiarity=topic_familiarity,
+            social_bond=min(1.0, member["bond_value"]),
+            is_mentioned=float(mentioned),
+            message_relevance=message_relevance,
+            fun_factor=self._fun_factor(group_id, text_value, now),
+            random_noise=self.rng.random(),
+        )
+        # 按参考算法组合八项基础特征与两个交互项，保留权重的可配置性。
+        raw_score = (
+            self.config.speak_weight_user_activity * features.user_activity
+            + self.config.speak_weight_group_activity * features.group_activity
+            + self.config.speak_weight_topic_familiarity * features.topic_familiarity
+            + self.config.speak_weight_social_bond * features.social_bond
+            + self.config.speak_weight_is_mentioned * features.is_mentioned
+            + self.config.speak_weight_message_relevance * features.message_relevance
+            + self.config.speak_weight_fun_factor * features.fun_factor
+            + self.config.speak_weight_random_noise * features.random_noise
+            + self.config.speak_weight_interaction_mentioned_topic
+            * features.is_mentioned
+            * features.topic_familiarity
+            + self.config.speak_weight_interaction_user_group_activity
+            * features.user_activity
+            * features.group_activity
+        )
+        # Sigmoid 把任意原始分映射到合法概率，再用独立随机数做最终抽样。
+        probability = stable_sigmoid(
+            self.config.speak_sigmoid_k
+            * (raw_score - self.config.speak_sigmoid_midpoint)
+        )
+        accepted = self.rng.random() < probability
         logger.debug(
-            "群 %s 主动回复评分 %.3f（近 %s 秒 %s 条）",
+            "群 %s 用户 %s 发言决策=%s raw=%.3f probability=%.3f features=%s",
             group_id,
-            score,
-            self.config.spontaneous_traffic_window_seconds,
-            message_count,
+            user_id,
+            accepted,
+            raw_score,
+            probability,
+            features,
         )
-        return score >= self.config.spontaneous_score_threshold
+        return SpeechDecision(
+            accepted,
+            probability,
+            raw_score,
+            features,
+            reason="概率抽样通过" if accepted else "概率抽样未通过",
+        )
+
+    def _speech_weights(self) -> dict[str, float]:
+        """给每项配置权重添加语义名称，避免后端只能看到难懂的位置参数。"""
+        return {
+            "user_activity": self.config.speak_weight_user_activity,
+            "group_activity": self.config.speak_weight_group_activity,
+            "topic_familiarity": self.config.speak_weight_topic_familiarity,
+            "social_bond": self.config.speak_weight_social_bond,
+            "is_mentioned": self.config.speak_weight_is_mentioned,
+            "message_relevance": self.config.speak_weight_message_relevance,
+            "fun_factor": self.config.speak_weight_fun_factor,
+            "random_noise": self.config.speak_weight_random_noise,
+            "mentioned_topic": self.config.speak_weight_interaction_mentioned_topic,
+            "user_group_activity": (
+                self.config.speak_weight_interaction_user_group_activity
+            ),
+        }
+
+    def _log_speech_decision(
+        self,
+        group_id: str,
+        user_id: str,
+        mentioned: bool,
+        decision: SpeechDecision,
+    ) -> None:
+        """用单行 JSON 输出一次发言判定，供控制台和日志采集后端读取。"""
+        weights = self._speech_weights()
+        feature_values = asdict(decision.features) if decision.features else None
+        contributions: dict[str, float] | None = None
+        if decision.features:
+            # 基础项贡献等于“实时特征值 × 配置权重”。
+            contributions = {
+                name: round(feature_values[name] * weights[name], 6)
+                for name in (
+                    "user_activity",
+                    "group_activity",
+                    "topic_familiarity",
+                    "social_bond",
+                    "is_mentioned",
+                    "message_relevance",
+                    "fun_factor",
+                    "random_noise",
+                )
+            }
+            # 两个交互项单独展开，使各项之和可以复算 raw_score。
+            contributions["mentioned_topic"] = round(
+                feature_values["is_mentioned"]
+                * feature_values["topic_familiarity"]
+                * weights["mentioned_topic"],
+                6,
+            )
+            contributions["user_group_activity"] = round(
+                feature_values["user_activity"]
+                * feature_values["group_activity"]
+                * weights["user_group_activity"],
+                6,
+            )
+
+        # 不写消息正文；ensure_ascii=False 让中文原因在 PowerShell 中可直接阅读。
+        payload = {
+            "event": "speech_decision",
+            "group_id": str(group_id),
+            "user_id": str(user_id),
+            "mentioned": bool(mentioned),
+            "will_speak": decision.accepted,
+            "probability": round(decision.probability, 6),
+            "raw_score": round(decision.raw_score, 6),
+            "reason": decision.reason,
+            "weights": weights,
+            "features": (
+                {name: round(value, 6) for name, value in feature_values.items()}
+                if feature_values
+                else None
+            ),
+            "contributions": contributions,
+        }
+        logger.info("发言判定 %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     def _build_group_context(
         self,
@@ -1462,6 +1874,12 @@ class QQBot:
             morning=morning,
             night=night,
         )
+        queue = self._recent_bot_replies[str(group_id)]
+        # 所有成功发送都影响“近期机器人是否话太多”，问候和提醒也包括在内。
+        queue.append(sent_at.timestamp())
+        cutoff = sent_at.timestamp() - self.config.speak_recent_reply_window_seconds
+        while queue and queue[0] < cutoff:
+            queue.popleft()
 
     async def _send_action(self, ws, action: str, params: dict, pending: dict):
         echo = f"{random.randrange(1 << 48):x}-{id(ws)}"

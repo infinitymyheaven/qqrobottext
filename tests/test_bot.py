@@ -19,9 +19,12 @@ from src.bot import (
     DeepSeekWebSearchError,
     OneBotActionError,
     QQBot,
+    cosine_similarity,
     extract_mentioned_ids,
     extract_message_text,
     is_at_self,
+    stable_sigmoid,
+    text_feature_vector,
 )
 from src.memory import MemoryStore
 
@@ -95,7 +98,7 @@ class FailingWebLLM(FakeLLM):
 
 
 class FixedRNG:
-    def __init__(self, value=1.0, uniform_value=180.0, randint_value=None):
+    def __init__(self, value=0.0, uniform_value=180.0, randint_value=None):
         self.value = value
         self.uniform_value = uniform_value
         self.randint_value = randint_value
@@ -146,6 +149,14 @@ class MessageParsingTest(unittest.TestCase):
             "1 & 2",
         )
         self.assertFalse(is_at_self(group_event("[CQ:at,qq=all] 大家好"), SELF_ID))
+
+    def test_text_vectors_are_stable_and_comparable(self):
+        first = text_feature_vector("机械键盘真好用")
+        second = text_feature_vector("机械键盘很好用")
+        unrelated = text_feature_vector("明天天气如何")
+        self.assertEqual(first, text_feature_vector("机械键盘真好用"))
+        self.assertGreater(cosine_similarity(first, second), cosine_similarity(first, unrelated))
+        self.assertAlmostEqual(stable_sigmoid(0), 0.5)
 
 
 class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
@@ -198,43 +209,31 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("987654321", json.dumps(captured["body"], ensure_ascii=False))
         self.assertEqual(captured["timeout"], 91)
 
-    async def test_explicit_search_and_time_force_web_and_log_sources(self):
+    async def test_current_time_uses_local_clock_without_web_request(self):
+        client = DeepSeekClient("test-key")
+        # 如果实现意外访问网络，side_effect 会让测试立即失败。
+        with patch("src.bot.urlopen", side_effect=AssertionError("不应请求网络")):
+            answer = await client.chat([], "现在几点了？", now=at_time(12, 30))
+        self.assertEqual(answer, "现在是 2026年09月09日 12:30（Asia/Shanghai）。")
+
+    async def test_foreign_location_time_is_not_mistaken_for_local_time(self):
+        captured = {}
         response = {
             "status": "completed",
             "output": [
-                {"type": "web_search_call", "action": {"type": "search"}},
-                {
-                    "type": "message",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": "现在十二点。 [来源](https://example.com/time)",
-                            "annotations": [
-                                {
-                                    "type": "url_citation",
-                                    "url": "https://example.com/time",
-                                    "title": "时间来源",
-                                }
-                            ],
-                        },
-                        {"type": "output_text", "text": "已经联网核验。"},
-                    ],
-                },
+                {"type": "message", "content": [{"type": "output_text", "text": "外地时间"}]}
             ],
         }
-        captured = {}
 
         def fake_urlopen(request, timeout):
             captured["body"] = json.loads(request.data.decode("utf-8"))
             return FakeHTTPResponse(response)
 
         client = DeepSeekClient("test-key")
-        with patch("src.bot.urlopen", fake_urlopen), self.assertLogs("qqrobot", level="INFO") as logs:
-            answer = await client.chat([], "现在几点了？", now=at_time(12, 30))
-        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
-        self.assertNotIn("https://", answer)
-        self.assertNotIn("内部推理", answer)
-        self.assertIn("https://example.com/time", "\n".join(logs.output))
+        with patch("src.bot.urlopen", fake_urlopen):
+            answer = await client.chat([], "纽约现在几点？", now=at_time(12, 30))
+        self.assertEqual(answer, "外地时间")
+        self.assertEqual(captured["body"]["tool_choice"], "auto")
 
     async def test_incomplete_web_response_is_an_error(self):
         client = DeepSeekClient("test-key")
@@ -301,13 +300,94 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.temp_dir.cleanup()
 
-    async def test_at_is_guaranteed_inside_window_and_silent_outside(self):
+    async def test_at_uses_probability_inside_window_and_is_silent_outside(self):
         await self.bot._handle_group_message(self.ws, mention_event("在吗"), self.pending)
         self.assertEqual(self.llm.chat_calls[0][1], "在吗")
         self.assertEqual(self.ws.sent[-1]["params"]["message"], "AI:在吗")
         self.current = at_time(19)
         await self.bot._handle_group_message(self.ws, mention_event("还在吗"), self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
+
+        self.current = at_time(11)
+        self.bot.rng = FixedRNG(value=1.0)
+        await self.bot._handle_group_message(self.ws, mention_event("概率拒绝"), self.pending)
+        self.assertEqual(len(self.llm.chat_calls), 1)
+
+    async def test_at_probability_bypasses_spontaneous_limits(self):
+        self.store.ensure_daily_spontaneous_limit(
+            GROUP_ID, self.current.date().isoformat(), 1, 1, 1
+        )
+        self.store.record_bot_message(
+            GROUP_ID,
+            self.current.date().isoformat(),
+            self.current.timestamp(),
+            spontaneous=True,
+        )
+        await self.bot._handle_group_message(
+            self.ws, mention_event("仍然参与概率判断"), self.pending
+        )
+        self.assertEqual(self.llm.chat_calls[-1][1], "仍然参与概率判断")
+
+    async def test_backend_log_contains_weights_contributions_and_decision(self):
+        with self.assertLogs("qqrobot", level="INFO") as captured:
+            await self.bot._handle_group_message(
+                self.ws, mention_event("不要把这段正文写入日志"), self.pending
+            )
+        decision_line = next(
+            line for line in captured.output if "发言判定 " in line
+        )
+        payload = json.loads(decision_line.split("发言判定 ", 1)[1])
+        self.assertEqual(payload["event"], "speech_decision")
+        self.assertTrue(payload["will_speak"])
+        self.assertIn("is_mentioned", payload["weights"])
+        self.assertIn("is_mentioned", payload["features"])
+        self.assertIn("mentioned_topic", payload["contributions"])
+        self.assertNotIn("不要把这段正文写入日志", decision_line)
+
+    async def test_backend_log_explains_off_hours_without_features(self):
+        self.current = at_time(9)
+        with self.assertLogs("qqrobot", level="INFO") as captured:
+            await self.bot._handle_group_message(
+                self.ws, mention_event("休息时段"), self.pending
+            )
+        payload = json.loads(captured.output[0].split("发言判定 ", 1)[1])
+        self.assertFalse(payload["will_speak"])
+        self.assertEqual(payload["reason"], "工作时段外")
+        self.assertIsNone(payload["features"])
+        self.assertTrue(payload["weights"])
+
+    def test_default_probability_calibration(self):
+        # 冷启动的典型 @ 应接近九成；FixedRNG 只固定抽样，不改变返回的 probability。
+        mentioned = self.bot._decide_speech(
+            GROUP_ID, "20002", "在吗？", True, self.current
+        )
+        self.assertGreaterEqual(mentioned.probability, 0.85)
+
+        # 先学习并记住同一话题，再验证普通高相关消息仍位于约 10%–30% 区间。
+        text = "机械键盘真好用？"
+        event = group_event([{"type": "text", "data": {"text": text}}])
+        self.bot._observe_speech_message(GROUP_ID, "20002", text, self.current)
+        self.bot._remember_recent(GROUP_ID, "20002", text, event, self.current)
+        related = self.bot._decide_speech(
+            GROUP_ID, "20002", text, False, self.current + timedelta(seconds=1)
+        )
+        self.assertGreaterEqual(related.probability, 0.10)
+        self.assertLessEqual(related.probability, 0.30)
+
+    async def test_off_hours_message_learns_profile_without_reply(self):
+        self.current = at_time(9)
+        event = group_event([{"type": "text", "data": {"text": "我喜欢机械键盘"}}])
+        await self.bot._handle_group_message(self.ws, event, self.pending)
+        member, _ = self.store.get_speech_profiles(
+            GROUP_ID,
+            "20002",
+            self.current.timestamp(),
+            activity_half_life_seconds=86400,
+            bond_half_life_seconds=30 * 86400,
+        )
+        self.assertEqual(self.llm.chat_calls, [])
+        self.assertEqual(member["message_count"], 1)
+        self.assertTrue(member["features"])
 
     async def test_web_search_failure_uses_uncertainty_reply(self):
         self.bot.llm_client = FailingWebLLM()
@@ -319,6 +399,15 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             self.ws.sent[-1]["params"]["message"],
             self.config.web_search_failure_reply,
         )
+        member, bot = self.store.get_speech_profiles(
+            GROUP_ID,
+            "20002",
+            self.current.timestamp(),
+            activity_half_life_seconds=86400,
+            bond_half_life_seconds=30 * 86400,
+        )
+        self.assertEqual(member["reply_count"], 0)
+        self.assertEqual(bot["reply_count"], 0)
 
     def test_minute_answer_time_boundaries(self):
         self.bot.config = BotConfig(
@@ -508,7 +597,6 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             timezone=TZ,
             group_context_window_seconds=300,
             spontaneous_traffic_window_seconds=60,
-            spontaneous_score_threshold=0.4,
         )
         self.bot.rng = FixedRNG(value=0.0)
         for index in range(10):
@@ -519,10 +607,13 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
                 group_event("旧消息", user_id=str(index)),
                 self.current - timedelta(seconds=120),
             )
-        self.assertFalse(self.bot._should_reply_spontaneously(GROUP_ID, self.current))
+        decision = self.bot._decide_speech(
+            GROUP_ID, "20002", "当前消息", False, self.current
+        )
+        self.assertAlmostEqual(decision.features.group_activity, 0.1)
 
     async def test_active_window_all_extracts_even_without_reply(self):
-        self.bot.rng = FixedRNG(value=0.0)
+        self.bot.rng = FixedRNG(value=1.0)
         event = group_event([{"type": "text", "data": {"text": "明天十点开会"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
         self.assertEqual(len(self.llm.chat_calls), 0)
@@ -563,7 +654,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             config=config,
             memory=self.store,
             now_provider=lambda: self.current,
-            rng=FixedRNG(value=0.0),
+            rng=FixedRNG(value=1.0),
         )
         event = group_event([{"type": "text", "data": {"text": "明天十点开会"}}])
         await bot._handle_group_message(self.ws, event, self.pending)
@@ -634,6 +725,9 @@ class ConfigParsingTest(unittest.TestCase):
             "SPONTANEOUS_DAILY_MIN": "60",
             "SPONTANEOUS_DAILY_MAX": "100",
             "SPONTANEOUS_REPLIES_ENABLED": "off",
+            "SPEAK_WEIGHT_IS_MENTIONED": "0.9",
+            "SPEAK_SIGMOID_K": "4.5",
+            "SPEAK_BOND_LEARNING_RATE": "0.2",
             "MORNING_GREETING_MESSAGES": "早安一||早安二",
             "ERROR_LOG_ENABLED": "yes",
             "ERROR_LOG_PATH": "runtime/custom-errors.txt",
@@ -646,6 +740,9 @@ class ConfigParsingTest(unittest.TestCase):
             config = BotConfig.from_env()
         self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (630, 1155))
         self.assertFalse(config.spontaneous_replies_enabled)
+        self.assertEqual(config.speak_weight_is_mentioned, 0.9)
+        self.assertEqual(config.speak_sigmoid_k, 4.5)
+        self.assertEqual(config.speak_bond_learning_rate, 0.2)
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
         self.assertTrue(config.web_search_enabled)
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
@@ -681,7 +778,9 @@ class ConfigParsingTest(unittest.TestCase):
             {"ANSWER_END_TIME": "24:01"},
             {"ANSWER_START_TIME": "20:00", "ANSWER_END_TIME": "19:00"},
             {"SPONTANEOUS_DAILY_MIN": "101", "SPONTANEOUS_DAILY_MAX": "100"},
-            {"SPONTANEOUS_RANDOM_WEIGHT": "0.5"},
+            {"SPEAK_WEIGHT_RANDOM_NOISE": "-0.5"},
+            {"SPEAK_SIGMOID_K": "0"},
+            {"SPEAK_INTEREST_LEARNING_RATE": "1.1"},
             {"FUTURE_MEMORY_ENABLED": "perhaps"},
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},
