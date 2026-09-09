@@ -3,8 +3,8 @@
 ## 1. 项目目标与当前状态
 
 - 项目名：`qqrobottext`，Python 3.10+ 的 QQ 群聊机器人。
-- 当前开发分支：`智能ai分支`，跟踪 `origin/智能ai分支`；不要自动合并或直接改写 `main`。
-- 分支基线：`main` 固定在 `1189ac6`；智能功能和后续修复只在当前分支演进。
+- 功能开发分支：`智能ai分支`，跟踪 `origin/智能ai分支`；PR #1 已把截至 `ca0b98e` 的功能合入 `main`，后续配置与文档提交也将按用户要求同步到 `main`。
+- `main` 和 `智能ai分支` 都是远端有效分支。开始工作前必须先 `git fetch origin` 并检查双方状态，不要假定或硬编码分支头提交。
 - 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek OpenAI 兼容 Chat Completions API。
 - 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、@回答、算法主动插话、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
 - 最近功能版本：`8afeadc`，已完成行为参数 `.env` 化、严格配置校验和每日随机主动回复上限。
@@ -103,7 +103,7 @@ cd D:\codex\qqrobot
 - 修改后至少执行：完整单元测试、`py_compile`、`git diff --check`、Git 状态检查和暂存区敏感值扫描。
 - 配置新增/改名时必须同步修改 `.env.example`、README 配置表、`BotConfig` 严格校验和配置测试。
 - 数据库字段变化必须提供针对旧 schema 的无损迁移测试。
-- 提交前确认 `main` 与 `origin/main` 仍为 `1189ac6`，只推送 `智能ai分支`。
+- 提交前确认工作区干净、目标分支明确且远端没有未知提交；默认不要跨分支推送，只有用户明确要求时才同步或合并到 `main`。
 - 远端仓库：`https://github.com/infinitymyheaven/qqrobottext`。
 
 ## 8. 已知运行环境与排障
