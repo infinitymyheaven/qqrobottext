@@ -8,7 +8,7 @@
 - 识别 QQ 号、昵称、群名片、群主、管理员、普通成员和专属头衔。
 - 群友改名、身份变化或退群后保留历史记录，不受模型上下文长度影响。
 - 每天 10:00–19:00 工作；包括 `@` 在内的候选消息都由多因素概率算法决定是否回答。
-- 普通主动回复受每日随机上限和最小间隔保护；`@` 仍经过概率判断，但不受这两项限制。
+- 独立意愿模块维护每群三小时消息流；普通消息与 `@` 都经过概率判断并共享每日 500 条上限。
 - 自动识别未来事项、持久化保存并在到期前提醒。
 - 普通群聊默认只保留最近五分钟的临时上下文，不永久保存全部聊天内容。
 
@@ -51,26 +51,25 @@ FUTURE_MEMORY_SOURCE=active_window_all
 
 程序先使用本地日期关键词过滤，只有疑似包含日期或时间的消息才调用 DeepSeek 提取，因此不会无条件分析每条消息。
 
-## 作息与主动回复算法
+## 作息与消息流回复意愿
 
 - 回答时段默认 `[10:00, 19:00)`，支持 `HH:MM` 分钟级配置，默认时区 `Asia/Shanghai`。
 - 工作开始后发送一次随机早安消息；工作结束后的 10 分钟内发送一次随机晚安消息。两者都可关闭或自定义模板。
-- 回答时段内，普通文字和 `@` 都计算回答概率；回答时段外保持沉默，但继续学习成员活跃度和兴趣画像。
-- 每个群每天从 `60–100` 中随机选取一个普通主动回复上限并持久化；普通消息还需满足最小发言间隔才计算概率，`@` 豁免这两项门槛。
-- 算法把成员活跃度、群流量、成员与机器人话题熟悉度、互动关系、是否被 @、近期话题相关性、趣味度和随机量归一化后计算原始分：
+- 回答时段内，普通文字和 `@` 都计算回答概率；回答时段外固定不回复，但仍记录消息、更新关系并参与低频话题分析。
+- `src/reply_willingness.py` 为每个群保存最多 500 条、最长三小时的内存消息流，每五秒刷新一次环境快照。普通消息没有 600 秒硬间隔，机器人回复后会短期降温，随后按时间和新消息数量恢复。
+- 每群每天最多发送 500 条由意愿算法批准的消息，包括 `@` 回复、空 `@` 提示和 API 失败提示；问候与事项提醒不计入。
+- 算法把固定用户活跃度、群整体活跃度、长期话题熟悉度、社会关系、是否被 @、消息与个人背景相关性、趣味度和随机量统一归一化后计算原始分：
 
 ```text
-原始分 = 各基础因素加权和
-       + @状态 × 话题熟悉度交互项
-       + 成员活跃度 × 群活跃度交互项
+原始分 = 八项参数的“特征值 × 权重”之和
 回答概率 = sigmoid(6 × (原始分 - 0.65))
 ```
 
-所有权重、Sigmoid 参数、画像半衰期和学习率都可在 `.env` 调整。算法使用固定 128 维字符特征，不需要额外模型或 NumPy。
+群活跃度中最近十分钟密度占 80%，十分钟前至三小时的密度占 20%，并考虑近期参与人数。`@` 权重很高，但仍经过概率抽样，不保证回答。
 
-每次白名单群内的其他成员发言时，PowerShell 都会输出一条 `发言判定` JSON 日志。日志包含各项配置权重、实时特征值、加权贡献、原始分、回答概率、是否发言及原因；工作时段外、达到上限和无文字内容也会记录。为避免常规日志复制聊天内容，日志不包含消息正文。
+每次白名单群内的其他成员发言时，PowerShell 都会立即输出一条 `INFO 意愿计算` JSON 日志。日志包含消息流统计、八项特征、八项权重、逐项贡献、命中话题、原始分、概率、抽样随机数、结果、原因和当日剩余额度；它在调用 DeepSeek 前输出，且不包含消息正文、个人背景、密钥或 Token。
 
-当天随机上限保存在 SQLite，重启不会改变。如果修改配置后旧上限不在新区间内，程序会为当天重新抽取。
+话题知识每群按 `10小时 - 7小时 × 群活跃度` 的间隔低频更新，严格限制在 3–10 小时。第一阶段只向 DeepSeek 发送匿名编号后的消息，第二阶段只将公开主题词交给 `web_search`；群聊原文、姓名和 QQ 号不会进入联网检索。话题按讨论热度保存为核心、次要和边缘三级。
 
 ## 永久资料与提醒
 
@@ -79,7 +78,10 @@ FUTURE_MEMORY_SOURCE=active_window_all
 - 启动、重连和每 6 小时通过 NapCat 全量同步群成员。
 - 成员加入、退出、管理员或群名片变化后自动刷新对应群。
 - 当前资料与变更历史均保留；退群成员标记为非活跃而不删除。
-- 发言算法的成员活跃度、成员兴趣、机器人群话题偏好和互动关系使用规范化 SQLite 表长期保存；稀疏向量的每个非零维度均由 SQL 独立管理，不存为 JSON。
+- 话题知识、每群话题热度、个人背景版本、社会关系和每日算法回复数使用规范化 SQLite 表长期保存；普通消息流本身只在内存保存，重启可丢失。
+- 目标账号通过本机 `.env` 的 `WILLINGNESS_PERSONA_USER_ID` 设置。首次启动尽力读取最近 30 天、最多 2000 条本人消息生成背景，之后按新发言增量更新；目标 QQ 号不要写入代码或提交。
+- 提炼出的背景摘要和兴趣不仅参与消息相关性计算，也会作为每次回答的长期人设参考。机器人只借鉴表达习惯和兴趣，不冒充模板账号、不透露其资料，也不会把群主或任何成员称为“主人”。
+- 群友 `@` 或引用机器人时，关系向 1 靠近 12%；机器人成功回复时向 1 靠近 8%。一天内不衰减，之后按指数曲线遗忘，在约 30 天归零。
 - AI 每次只读取当前发言者、群主/管理员、被 @ 或问题中明确提到的成员，匹配数量可配置，避免把大群名册塞进每次请求。
 - 最近群聊默认保留 5 分钟、最多 20 条、每条最多 300 字；逐成员对话默认保留 10 条，闲置 30 分钟后清空。
 - 未来事项默认提前 60 分钟发送普通文本提醒；若时间落在睡眠时段，会提前移动到最近的工作时段。
@@ -109,7 +111,7 @@ Copy-Item .env.example .env
 - 消息格式：`array`
 - Access Token：可留空；填写时需同步到 `.env`
 
-机器人通过以下 OneBot 动作读取资料：`get_group_list`、`get_group_member_list`；通过 `send_group_msg` 发言。
+机器人通过 `get_group_list`、`get_group_member_list`、`get_group_msg_history` 和 `get_msg` 读取所需资料，通过 `send_group_msg` 发言并保存返回的消息 ID，以识别后续引用。
 
 ## DeepSeek 配置
 
@@ -122,6 +124,8 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
 `deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通问题由模型判断是否联网，明确要求搜索时强制联网核验。天气、新闻等实时信息和本地未来事项中没有记录的外部事件均可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
+
+默认 `DEEPSEEK_SYSTEM_PROMPT` 将机器人定义为群内平等、自然且有分寸的群友。每次回答还会从 SQLite 注入 `WILLINGNESS_PERSONA_USER_ID` 对应的最新背景摘要作为风格模板；背景内容按描述性数据处理，不能覆盖系统规则。
 
 “现在几点”“当前时间”等本地时间问题直接使用机器人已经持有的带时区时钟回答，不调用 DeepSeek，也不依赖 `web_search`。这样既更快，也不会因为模型没有执行搜索工具而误报联网失败；询问其他地区时间等需要外部判断的问题仍交给模型处理。
 
@@ -148,21 +152,24 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `BOT_TIMEZONE` | `Asia/Shanghai` | 作息和提醒时区 |
 | `ANSWER_START_TIME` / `ANSWER_END_TIME` | `10:00` / `19:00` | 分钟级工作时段；结束时间必须更晚，`24:00` 仅可用于结束 |
 | `SPONTANEOUS_REPLIES_ENABLED` | `true` | 是否允许算法主动插话 |
-| `SPONTANEOUS_DAILY_MIN` / `SPONTANEOUS_DAILY_MAX` | `60` / `100` | 每群每天随机主动回复上限区间 |
-| `SPONTANEOUS_MIN_INTERVAL_SECONDS` | `600` | 主动回复最小间隔 |
-| `SPONTANEOUS_TRAFFIC_WINDOW_SECONDS` | `60` | 流量评分统计窗口 |
-| `SPONTANEOUS_TRAFFIC_FULL_SCORE_MESSAGES` | `10` | 流量项达到满分所需消息数 |
-| `SPEAK_WEIGHT_USER_ACTIVITY` / `SPEAK_WEIGHT_GROUP_ACTIVITY` | `0.08` / `0.08` | 发言者长期活跃度和群内近期流量权重 |
+| `WILLINGNESS_MESSAGE_LIMIT` / `WILLINGNESS_MESSAGE_MAX_AGE_SECONDS` | `500` / `10800` | 每群内存消息流条数和三小时时间边界 |
+| `WILLINGNESS_UPDATE_SECONDS` / `WILLINGNESS_DAILY_REPLY_LIMIT` | `5` / `500` | 环境刷新周期和每群每日算法回复总上限 |
+| `WILLINGNESS_USER_ACTIVITY` | `0.5` | 八参数中的固定用户活跃度，范围 0–1 |
+| `WILLINGNESS_SHORT_WINDOW_SECONDS` | `600` | 群活跃度的近期主窗口 |
+| `WILLINGNESS_SHORT_FULL_MESSAGES` / `WILLINGNESS_OLD_FULL_MESSAGES` | `30` / `120` | 近期和较早消息密度达到满分的尺度 |
+| `WILLINGNESS_TOPIC_ANALYSIS_MIN_HOURS` / `WILLINGNESS_TOPIC_ANALYSIS_MAX_HOURS` | `3` / `10` | 每群 AI 话题分析间隔边界 |
+| `WILLINGNESS_PERSONA_USER_ID` | 空 | 需要构建个人背景的目标 QQ 号；只填写到本机 `.env` |
+| `WILLINGNESS_PERSONAL_BACKGROUND` | 内置通用背景 | 无历史资料时使用的本地相关性种子 |
+| `WILLINGNESS_HISTORY_DAYS` | `30` | 首次个人背景历史时间范围 |
+| `WILLINGNESS_HISTORY_MESSAGE_LIMIT` / `WILLINGNESS_HISTORY_SCAN_LIMIT` | `2000` / `10000` | 最多收集的本人消息数和最多扫描的源消息数 |
+| `WILLINGNESS_BOND_INBOUND_RATE` / `WILLINGNESS_BOND_OUTBOUND_RATE` | `0.12` / `0.08` | 群友与机器人双向互动时关系向 1 靠近的比例 |
+| `WILLINGNESS_BOND_GRACE_HOURS` / `WILLINGNESS_BOND_ZERO_DAYS` | `24` / `30` | 关系遗忘宽限期和归零边界 |
+| `WILLINGNESS_REPLY_COOLDOWN_SECONDS` | `120` | 回复后群级意愿按时间恢复至正常的最长时间；新消息可加速恢复 |
+| `SPEAK_WEIGHT_USER_ACTIVITY` / `SPEAK_WEIGHT_GROUP_ACTIVITY` | `0.08` / `0.08` | 固定用户活跃度和群消息密度权重 |
 | `SPEAK_WEIGHT_TOPIC_FAMILIARITY` / `SPEAK_WEIGHT_SOCIAL_BOND` | `0.12` / `0.12` | 长期话题熟悉度和成员互动关系权重 |
-| `SPEAK_WEIGHT_IS_MENTIONED` / `SPEAK_WEIGHT_MESSAGE_RELEVANCE` | `1.0` / `0.12` | 被 @ 和当前消息与近期群话题相关度权重；默认让典型 @ 概率约为 90% |
-| `SPEAK_WEIGHT_FUN_FACTOR` / `SPEAK_WEIGHT_RANDOM_NOISE` | `0.08` / `0.05` | 消息对话性和随机扰动权重 |
-| `SPEAK_WEIGHT_INTERACTION_MENTIONED_TOPIC` | `0.15` | “被 @ × 话题熟悉度”交互项权重 |
-| `SPEAK_WEIGHT_INTERACTION_USER_GROUP_ACTIVITY` | `0.05` | “成员活跃度 × 群流量”交互项权重 |
+| `SPEAK_WEIGHT_IS_MENTIONED` / `SPEAK_WEIGHT_MESSAGE_RELEVANCE` | `1.0` / `0.12` | 被 @ 和当前消息与个人背景相关度权重；典型 @ 概率约为 90% |
+| `SPEAK_WEIGHT_FUN_FACTOR` / `SPEAK_WEIGHT_RANDOM_NOISE` | `0.08` / `0.05` | AI 情绪/话题回复热度和随机扰动权重 |
 | `SPEAK_SIGMOID_K` / `SPEAK_SIGMOID_MIDPOINT` | `6.0` / `0.65` | 原始分转换为回答概率的曲线参数 |
-| `SPEAK_USER_ACTIVITY_FULL_SCORE_MESSAGES` | `20` | 成员活跃度归一化尺度 |
-| `SPEAK_ACTIVITY_HALF_LIFE_HOURS` / `SPEAK_BOND_HALF_LIFE_DAYS` | `24` / `30` | 活跃度和互动关系的时间衰减速度 |
-| `SPEAK_BOND_LEARNING_RATE` / `SPEAK_INTEREST_LEARNING_RATE` | `0.10` / `0.20` | 关系及兴趣画像学习率，范围 0–1 |
-| `SPEAK_RECENT_REPLY_WINDOW_SECONDS` / `SPEAK_RECENT_REPLY_FULL_COUNT` | `600` / `5` | 趣味度中机器人近期发言饱和度参数 |
 | `MEMBER_SYNC_INTERVAL_SECONDS` | `21600` | 全量成员同步间隔 |
 | `MEMBER_CONTEXT_MATCH_LIMIT` | `20` | 单次回答按名称等检索的成员上限 |
 | `FUTURE_MEMORY_ENABLED` | `true` | 是否提取、注入和提醒未来事项 |
@@ -186,7 +193,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `ERROR_LOG_BEFORE_RECORDS` / `ERROR_LOG_AFTER_RECORDS` | `30` / `10` | 每次错误保存的前后状态条数 |
 | `ERROR_LOG_MAX_BYTES` / `ERROR_LOG_BACKUP_COUNT` | `1048576` / `2` | 单文件空间上限与旧文件保留数量 |
 
-布尔值可写 `true/false`、`1/0`、`yes/no` 或 `on/off`。配置使用严格校验：格式错误、范围倒置、无效时区或权重之和不为 1 时，程序会在连接 NapCat 前退出并指出变量名。`FUTURE_MEMORY_ENABLED=false` 会同时停止新事项提取、事项上下文注入和主动提醒。旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR` 和 `SPONTANEOUS_DAILY_LIMIT` 已废弃。
+布尔值可写 `true/false`、`1/0`、`yes/no` 或 `on/off`。配置使用严格校验：格式错误、范围倒置、无效时区或非法权重会让程序在连接 NapCat 前退出并指出变量名。`FUTURE_MEMORY_ENABLED=false` 会同时停止新事项提取、事项上下文注入和主动提醒。旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR`、`SPONTANEOUS_DAILY_LIMIT`、`SPONTANEOUS_DAILY_MIN/MAX`、`SPONTANEOUS_MIN_INTERVAL_SECONDS`、旧流量窗口及两个交互项均已废弃。
 
 联网请求只带当前问题、有限对话历史和按需检索的本地资料，并会隐藏其中的 QQ 数字标识；不会发送完整群成员名单。DeepSeek 若没有返回 URL 注解，日志只说明执行过哪些搜索动作。联网功能会增加响应时间和 API 用量。
 

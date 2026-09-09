@@ -22,11 +22,13 @@ from src.bot import (
     cosine_similarity,
     extract_mentioned_ids,
     extract_message_text,
+    extract_reply_message_id,
     is_at_self,
     stable_sigmoid,
     text_feature_vector,
 )
 from src.memory import MemoryStore
+from src.reply_willingness import StreamMessage
 
 TZ = ZoneInfo("Asia/Shanghai")
 SELF_ID = "10001"
@@ -81,6 +83,7 @@ class FakeLLM:
     def __init__(self, *, events=None):
         self.chat_calls = []
         self.extract_calls = []
+        self.persona_calls = []
         self.events = events or []
 
     async def chat(self, history, user_text, *, context="", now=None):
@@ -90,6 +93,16 @@ class FakeLLM:
     async def extract_future_events(self, text, now):
         self.extract_calls.append((text, now))
         return list(self.events)
+
+    async def analyze_willingness_topics(self, messages, now):
+        return []
+
+    async def enrich_willingness_topics(self, queries, now):
+        return {}
+
+    async def analyze_persona(self, messages, metadata, seed, now):
+        self.persona_calls.append((list(messages), dict(metadata), seed, now))
+        return {"summary": seed, "interests": [], "last_source_message_at": now}
 
 
 class FailingWebLLM(FakeLLM):
@@ -149,6 +162,7 @@ class MessageParsingTest(unittest.TestCase):
             "1 & 2",
         )
         self.assertFalse(is_at_self(group_event("[CQ:at,qq=all] 大家好"), SELF_ID))
+        self.assertEqual(extract_reply_message_id(group_event("[CQ:reply,id=42] 收到")), "42")
 
     def test_text_vectors_are_stable_and_comparable(self):
         first = text_feature_vector("机械键盘真好用")
@@ -160,6 +174,12 @@ class MessageParsingTest(unittest.TestCase):
 
 
 class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_default_persona_is_equal_group_member_not_an_owner(self):
+        client = DeepSeekClient("test-key")
+        self.assertIn("自然、平等", client.system_prompt)
+        self.assertIn("不是该用户", client.system_prompt)
+        self.assertNotIn("群主的主人", client.system_prompt)
+
     async def test_chat_includes_local_context(self):
         captured = {}
 
@@ -276,6 +296,35 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             events = await client.extract_future_events("明天十点开会", at_time(11))
         self.assertEqual(events[0]["summary"], "开会")
 
+    async def test_topic_enrichment_forces_web_with_public_queries_only(self):
+        captured = {}
+        response = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "action": {"type": "search"}},
+                {
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": '{"Python 最新版本":"公开摘要"}',
+                    }],
+                },
+            ],
+        }
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(response)
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen):
+            result = await client.enrich_willingness_topics(["Python 最新版本"], 1.0)
+        self.assertEqual(result, {"Python 最新版本": "公开摘要"})
+        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
+        serialized = json.dumps(captured["body"], ensure_ascii=False)
+        self.assertIn("Python 最新版本", serialized)
+        self.assertNotIn("群聊原文", serialized)
+
 
 class BotTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -309,7 +358,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.llm.chat_calls), 1)
 
         self.current = at_time(11)
-        self.bot.rng = FixedRNG(value=1.0)
+        self.bot.willingness.rng = FixedRNG(value=1.0)
         await self.bot._handle_group_message(self.ws, mention_event("概率拒绝"), self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
 
@@ -333,15 +382,14 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_group_message(
                 self.ws, mention_event("不要把这段正文写入日志"), self.pending
             )
-        decision_line = next(
-            line for line in captured.output if "发言判定 " in line
-        )
-        payload = json.loads(decision_line.split("发言判定 ", 1)[1])
-        self.assertEqual(payload["event"], "speech_decision")
-        self.assertTrue(payload["will_speak"])
+        decision_line = next(line for line in captured.output if "意愿计算 " in line)
+        payload = json.loads(decision_line.split("意愿计算 ", 1)[1])
+        self.assertEqual(payload["event"], "willingness_decision")
+        self.assertTrue(payload["will_reply"])
         self.assertIn("is_mentioned", payload["weights"])
         self.assertIn("is_mentioned", payload["features"])
-        self.assertIn("mentioned_topic", payload["contributions"])
+        self.assertEqual(len(payload["contributions"]), 8)
+        self.assertIn("daily_remaining", payload)
         self.assertNotIn("不要把这段正文写入日志", decision_line)
 
     async def test_backend_log_explains_off_hours_without_features(self):
@@ -350,44 +398,39 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_group_message(
                 self.ws, mention_event("休息时段"), self.pending
             )
-        payload = json.loads(captured.output[0].split("发言判定 ", 1)[1])
-        self.assertFalse(payload["will_speak"])
+        line = next(item for item in captured.output if "意愿计算 " in item)
+        payload = json.loads(line.split("意愿计算 ", 1)[1])
+        self.assertFalse(payload["will_reply"])
         self.assertEqual(payload["reason"], "工作时段外")
-        self.assertIsNone(payload["features"])
+        self.assertEqual(len(payload["features"]), 8)
         self.assertTrue(payload["weights"])
 
     def test_default_probability_calibration(self):
         # 冷启动的典型 @ 应接近九成；FixedRNG 只固定抽样，不改变返回的 probability。
-        mentioned = self.bot._decide_speech(
-            GROUP_ID, "20002", "在吗？", True, self.current
+        self.bot.willingness.record_message(
+            StreamMessage(GROUP_ID, "20002", "用户", self.current.timestamp(), "在吗？")
+        )
+        mentioned = self.bot.willingness.decide(
+            GROUP_ID, "20002", "在吗？", mentioned=True, within_work_hours=True,
+            local_date=self.current.date().isoformat(), now=self.current.timestamp()
         )
         self.assertGreaterEqual(mentioned.probability, 0.85)
 
-        # 先学习并记住同一话题，再验证普通高相关消息仍位于约 10%–30% 区间。
+        # 普通冷启动消息的概率仍保持克制，不会因为取消硬间隔而必然抢话。
         text = "机械键盘真好用？"
-        event = group_event([{"type": "text", "data": {"text": text}}])
-        self.bot._observe_speech_message(GROUP_ID, "20002", text, self.current)
-        self.bot._remember_recent(GROUP_ID, "20002", text, event, self.current)
-        related = self.bot._decide_speech(
-            GROUP_ID, "20002", text, False, self.current + timedelta(seconds=1)
+        related = self.bot.willingness.decide(
+            GROUP_ID, "20002", text, mentioned=False, within_work_hours=True,
+            local_date=self.current.date().isoformat(), now=self.current.timestamp() + 1
         )
-        self.assertGreaterEqual(related.probability, 0.10)
-        self.assertLessEqual(related.probability, 0.30)
+        self.assertGreaterEqual(related.probability, 0.02)
+        self.assertLessEqual(related.probability, 0.35)
 
     async def test_off_hours_message_learns_profile_without_reply(self):
         self.current = at_time(9)
         event = group_event([{"type": "text", "data": {"text": "我喜欢机械键盘"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
-        member, _ = self.store.get_speech_profiles(
-            GROUP_ID,
-            "20002",
-            self.current.timestamp(),
-            activity_half_life_seconds=86400,
-            bond_half_life_seconds=30 * 86400,
-        )
         self.assertEqual(self.llm.chat_calls, [])
-        self.assertEqual(member["message_count"], 1)
-        self.assertTrue(member["features"])
+        self.assertEqual(len(self.bot.willingness.messages(GROUP_ID, self.current.timestamp())), 1)
 
     async def test_web_search_failure_uses_uncertainty_reply(self):
         self.bot.llm_client = FailingWebLLM()
@@ -399,15 +442,10 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             self.ws.sent[-1]["params"]["message"],
             self.config.web_search_failure_reply,
         )
-        member, bot = self.store.get_speech_profiles(
-            GROUP_ID,
-            "20002",
-            self.current.timestamp(),
-            activity_half_life_seconds=86400,
-            bond_half_life_seconds=30 * 86400,
+        self.assertEqual(
+            self.store.get_algorithm_reply_count(GROUP_ID, self.current.date().isoformat()),
+            1,
         )
-        self.assertEqual(member["reply_count"], 0)
-        self.assertEqual(bot["reply_count"], 0)
 
     def test_minute_answer_time_boundaries(self):
         self.bot.config = BotConfig(
@@ -421,20 +459,19 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.bot.is_answer_time(at_time(19, 14)))
         self.assertFalse(self.bot.is_answer_time(at_time(19, 15)))
 
-    async def test_spontaneous_score_interval_and_daily_limit(self):
+    async def test_no_hard_interval_and_daily_limit(self):
         event = group_event([{"type": "text", "data": {"text": "普通话题"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
 
         self.current += timedelta(seconds=100)
         await self.bot._handle_group_message(self.ws, event, self.pending)
-        self.assertEqual(len(self.llm.chat_calls), 1)
+        self.assertEqual(len(self.llm.chat_calls), 2)
 
         limited_config = BotConfig(
             active_group_ids=frozenset({GROUP_ID}),
             timezone=TZ,
-            spontaneous_daily_min=1,
-            spontaneous_daily_max=1,
+            willingness_daily_reply_limit=1,
         )
         limited = QQBot(
             "ws://test",
@@ -445,9 +482,9 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             rng=FixedRNG(),
         )
         await limited._handle_group_message(self.ws, event, self.pending)
-        self.assertEqual(len(self.llm.chat_calls), 1)
+        self.assertEqual(len(self.llm.chat_calls), 2)
 
-    async def test_concurrent_messages_cannot_bypass_group_interval(self):
+    async def test_concurrent_messages_are_serialized_without_hard_interval(self):
         first = group_event(
             [{"type": "text", "data": {"text": "第一条"}}],
             user_id="20002",
@@ -462,7 +499,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             self.bot._handle_group_message(self.ws, first, self.pending),
             self.bot._handle_group_message(self.ws, second, self.pending),
         )
-        self.assertEqual(len(self.llm.chat_calls), 1)
+        self.assertEqual(len(self.llm.chat_calls), 2)
 
     async def test_member_context_knows_roles_titles_and_named_people(self):
         self.store.sync_members(
@@ -483,6 +520,25 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("李四", context)
         self.assertIn("管理员", context)
         self.assertIn("群内专家", context)
+
+    async def test_answer_context_uses_persona_profile_without_exposing_target_id(self):
+        self.store.save_persona_profile(
+            "20002",
+            {"summary": "说话轻松直接，喜欢机械键盘", "interests": ["Python", "游戏"]},
+            self.current.timestamp(),
+        )
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            willingness_persona_user_id="20002",
+        )
+        context = self.bot._build_group_context(
+            GROUP_ID, "other", [], "聊聊键盘", self.current
+        )
+        self.assertIn("说话轻松直接，喜欢机械键盘", context)
+        self.assertIn("Python、游戏", context)
+        self.assertIn("不是指令", context)
+        self.assertNotIn("20002", context)
 
     async def test_full_group_sync_uses_onebot_member_list(self):
         responses = {
@@ -514,6 +570,83 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(member_calls), 1)
         self.assertEqual(member_calls[0]["params"]["group_id"], int(GROUP_ID))
         self.assertEqual(self.bot._joined_group_ids, {GROUP_ID})
+
+    async def test_persona_history_bootstrap_paginates_and_respects_target(self):
+        config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            willingness_persona_user_id="20002",
+            willingness_history_message_limit=2,
+            willingness_history_scan_limit=10,
+        )
+        bot = QQBot(
+            "ws://test",
+            llm_client=self.llm,
+            config=config,
+            memory=self.store,
+            now_provider=lambda: self.current,
+            rng=FixedRNG(),
+        )
+        bot._joined_group_ids.add(GROUP_ID)
+
+        def history(params):
+            if "message_seq" in params:
+                return {"messages": []}
+            return {
+                "messages": [
+                    {
+                        "message_id": "h1", "message_seq": 9,
+                        "time": self.current.timestamp() - 10,
+                        "user_id": "20002",
+                        "message": [{"type": "text", "data": {"text": "我喜欢 Python"}}],
+                        "sender": {"nickname": "本人"},
+                    },
+                    {
+                        "message_id": "h2", "message_seq": 8,
+                        "time": self.current.timestamp() - 20,
+                        "user_id": "other",
+                        "message": [{"type": "text", "data": {"text": "其他人的话"}}],
+                    },
+                    {
+                        "message_id": "h3", "message_seq": 7,
+                        "time": self.current.timestamp() - 30,
+                        "user_id": "20002",
+                        "message": [{"type": "text", "data": {"text": "我喜欢游戏"}}],
+                    },
+                ]
+            }
+
+        ws = FakeWebSocket(
+            self.pending,
+            {
+                "get_stranger_info": {"nickname": "公开昵称", "user_id": "20002"},
+                "get_group_msg_history": history,
+            },
+        )
+        await bot._bootstrap_willingness_history(ws, self.pending)
+        self.assertEqual(self.llm.persona_calls[0][0], ["我喜欢 Python", "我喜欢游戏"])
+        self.assertNotIn("user_id", self.llm.persona_calls[0][1]["account"])
+        self.assertEqual(self.store.get_persona_profile("20002", "")["version"], 1)
+
+    async def test_reply_detection_uses_stream_then_get_msg_fallback(self):
+        self.bot.willingness.record_message(
+            StreamMessage(
+                GROUP_ID, "bot", "机器人", self.current.timestamp(), "回复",
+                message_id="local", is_bot=True,
+            )
+        )
+        self.assertTrue(
+            await self.bot._reply_targets_bot(
+                self.ws, self.pending, GROUP_ID, SELF_ID, "local", self.current
+            )
+        )
+        ws = FakeWebSocket(self.pending, {"get_msg": {"user_id": SELF_ID}})
+        self.assertTrue(
+            await self.bot._reply_targets_bot(
+                ws, self.pending, GROUP_ID, SELF_ID, "remote", self.current
+            )
+        )
+        self.assertEqual([item["action"] for item in ws.sent], ["get_msg"])
 
     async def test_failed_scheduled_send_pauses_group_without_raising(self):
         self.bot._send_group_message = AsyncMock(
@@ -583,37 +716,37 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         )
         for index, text in enumerate(("过期消息", "第一条很长", "第二条很长")):
             when = self.current - timedelta(seconds=301 if index == 0 else 10 - index)
-            self.bot._remember_recent(
-                GROUP_ID, str(index), text, group_event(text, user_id=str(index)), when
+            self.bot.willingness.record_message(
+                StreamMessage(
+                    GROUP_ID,
+                    str(index),
+                    f"用户{index}",
+                    when.timestamp(),
+                    text[: self.bot.config.group_context_message_max_chars],
+                )
             )
         context = self.bot._build_group_context(GROUP_ID, "20002", [], "问题", self.current)
         self.assertNotIn("过期消息", context)
         self.assertIn("第一条很", context)
         self.assertIn("第二条很", context)
 
-    async def test_traffic_score_uses_independent_window(self):
-        self.bot.config = BotConfig(
-            active_group_ids=frozenset({GROUP_ID}),
-            timezone=TZ,
-            group_context_window_seconds=300,
-            spontaneous_traffic_window_seconds=60,
-        )
-        self.bot.rng = FixedRNG(value=0.0)
+    async def test_group_activity_uses_ten_minute_window(self):
+        self.bot.willingness.rng = FixedRNG(value=0.0)
         for index in range(10):
-            self.bot._remember_recent(
-                GROUP_ID,
-                str(index),
-                "旧消息",
-                group_event("旧消息", user_id=str(index)),
-                self.current - timedelta(seconds=120),
+            self.bot.willingness.record_message(
+                StreamMessage(
+                    GROUP_ID, str(index), f"用户{index}",
+                    (self.current - timedelta(seconds=120)).timestamp(), "近期消息"
+                )
             )
-        decision = self.bot._decide_speech(
-            GROUP_ID, "20002", "当前消息", False, self.current
+        decision = self.bot.willingness.decide(
+            GROUP_ID, "20002", "当前消息", mentioned=False, within_work_hours=True,
+            local_date=self.current.date().isoformat(), now=self.current.timestamp()
         )
-        self.assertAlmostEqual(decision.features.group_activity, 0.1)
+        self.assertGreater(decision.features.group_activity, 0.25)
 
     async def test_active_window_all_extracts_even_without_reply(self):
-        self.bot.rng = FixedRNG(value=1.0)
+        self.bot.willingness.rng = FixedRNG(value=1.0)
         event = group_event([{"type": "text", "data": {"text": "明天十点开会"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
         self.assertEqual(len(self.llm.chat_calls), 0)
@@ -722,12 +855,12 @@ class ConfigParsingTest(unittest.TestCase):
         values = {
             "ANSWER_START_TIME": "10:30",
             "ANSWER_END_TIME": "19:15",
-            "SPONTANEOUS_DAILY_MIN": "60",
-            "SPONTANEOUS_DAILY_MAX": "100",
             "SPONTANEOUS_REPLIES_ENABLED": "off",
+            "WILLINGNESS_DAILY_REPLY_LIMIT": "321",
+            "WILLINGNESS_USER_ACTIVITY": "0.7",
+            "WILLINGNESS_BOND_INBOUND_RATE": "0.2",
             "SPEAK_WEIGHT_IS_MENTIONED": "0.9",
             "SPEAK_SIGMOID_K": "4.5",
-            "SPEAK_BOND_LEARNING_RATE": "0.2",
             "MORNING_GREETING_MESSAGES": "早安一||早安二",
             "ERROR_LOG_ENABLED": "yes",
             "ERROR_LOG_PATH": "runtime/custom-errors.txt",
@@ -742,7 +875,9 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertFalse(config.spontaneous_replies_enabled)
         self.assertEqual(config.speak_weight_is_mentioned, 0.9)
         self.assertEqual(config.speak_sigmoid_k, 4.5)
-        self.assertEqual(config.speak_bond_learning_rate, 0.2)
+        self.assertEqual(config.willingness_daily_reply_limit, 321)
+        self.assertEqual(config.willingness_user_activity, 0.7)
+        self.assertEqual(config.willingness_bond_inbound_rate, 0.2)
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
         self.assertTrue(config.web_search_enabled)
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
@@ -756,12 +891,17 @@ class ConfigParsingTest(unittest.TestCase):
     def test_legacy_hour_variables_are_ignored(self):
         with patch.dict(
             os.environ,
-            {"ANSWER_START_HOUR": "1", "ANSWER_END_HOUR": "2", "SPONTANEOUS_DAILY_LIMIT": "3"},
+            {
+                "ANSWER_START_HOUR": "1",
+                "ANSWER_END_HOUR": "2",
+                "SPONTANEOUS_DAILY_LIMIT": "3",
+                "SPONTANEOUS_MIN_INTERVAL_SECONDS": "1",
+            },
             clear=True,
         ):
             config = BotConfig.from_env()
         self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (600, 1140))
-        self.assertEqual((config.spontaneous_daily_min, config.spontaneous_daily_max), (60, 100))
+        self.assertEqual(config.willingness_daily_reply_limit, 500)
 
     def test_all_day_time_range(self):
         with patch.dict(
@@ -777,10 +917,19 @@ class ConfigParsingTest(unittest.TestCase):
             {"ANSWER_START_TIME": "9:00"},
             {"ANSWER_END_TIME": "24:01"},
             {"ANSWER_START_TIME": "20:00", "ANSWER_END_TIME": "19:00"},
-            {"SPONTANEOUS_DAILY_MIN": "101", "SPONTANEOUS_DAILY_MAX": "100"},
+            {"WILLINGNESS_DAILY_REPLY_LIMIT": "0"},
+            {"WILLINGNESS_DAILY_REPLY_LIMIT": "501"},
+            {"WILLINGNESS_MESSAGE_LIMIT": "501"},
+            {"WILLINGNESS_MESSAGE_MAX_AGE_SECONDS": "10801"},
+            {"WILLINGNESS_USER_ACTIVITY": "1.1"},
+            {"WILLINGNESS_TOPIC_ANALYSIS_MIN_HOURS": "2.9"},
+            {"WILLINGNESS_TOPIC_ANALYSIS_MAX_HOURS": "10.1"},
+            {"WILLINGNESS_HISTORY_MESSAGE_LIMIT": "101", "WILLINGNESS_HISTORY_SCAN_LIMIT": "100"},
             {"SPEAK_WEIGHT_RANDOM_NOISE": "-0.5"},
             {"SPEAK_SIGMOID_K": "0"},
-            {"SPEAK_INTEREST_LEARNING_RATE": "1.1"},
+            {"WILLINGNESS_BOND_INBOUND_RATE": "1.1"},
+            {"WILLINGNESS_BOND_GRACE_HOURS": "48", "WILLINGNESS_BOND_ZERO_DAYS": "1"},
+            {"WILLINGNESS_PERSONA_USER_ID": "not-a-number"},
             {"FUTURE_MEMORY_ENABLED": "perhaps"},
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},

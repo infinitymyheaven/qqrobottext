@@ -128,6 +128,7 @@ class MemoryStoreTest(unittest.TestCase):
         activity = self.store.get_activity("g", "d")
         self.assertEqual(activity["spontaneous_count"], 4)
         self.assertIsNone(activity["daily_spontaneous_limit"])
+        self.assertEqual(activity["algorithm_reply_count"], 0)
         # 旧库打开后会原地补建规范化画像表，不需要删除或重建数据库。
         tables = {
             row[0]
@@ -141,6 +142,10 @@ class MemoryStoreTest(unittest.TestCase):
                 "speech_member_features",
                 "speech_bot_profiles",
                 "speech_bot_features",
+                "willingness_topics",
+                "willingness_topic_aliases",
+                "willingness_group_topics",
+                "willingness_personas",
             }.issubset(tables)
         )
 
