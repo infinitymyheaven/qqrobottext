@@ -17,6 +17,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Iterable
 
+if __package__:
+    from .persona import merge_persona_profiles
+else:
+    from persona import merge_persona_profiles
+
 
 logger = logging.getLogger("qqrobot")
 VECTOR_DIMENSIONS = 128
@@ -116,6 +121,10 @@ class WillingnessConfig:
     history_days: int = 30
     history_message_limit: int = 2000
     history_scan_limit: int = 10_000
+    persona_increment_min_messages: int = 50
+    persona_increment_max_hours: float = 24.0
+    persona_increment_floor_messages: int = 10
+    persona_group_style_weight: float = 0.70
     bond_inbound_rate: float = 0.12
     bond_outbound_rate: float = 0.08
     bond_grace_hours: float = 24.0
@@ -221,6 +230,8 @@ class ReplyWillingnessEngine:
         self.store = store
         self.rng = rng
         self._messages: defaultdict[str, deque[StreamMessage]] = defaultdict(deque)
+        # 人格增量需要跨越三小时意愿窗口；单独队列最多保留两倍最长更新周期。
+        self._persona_pending: deque[StreamMessage] = deque()
         self._snapshots: dict[str, EnvironmentSnapshot] = {}
         self._last_bot_reply_at: dict[str, float] = {}
         self._analysis_running: set[str] = set()
@@ -235,6 +246,27 @@ class ReplyWillingnessEngine:
         else:
             queue.append(message)
         self._prune_group(message.group_id, message.sent_at)
+        if (
+            self.config.persona_user_id
+            and message.user_id == self.config.persona_user_id
+            and message.text
+            and not message.is_bot
+        ):
+            if self._persona_pending and message.sent_at < self._persona_pending[-1].sent_at:
+                ordered_persona = sorted(
+                    (*self._persona_pending, message), key=lambda item: item.sent_at
+                )
+                self._persona_pending.clear()
+                self._persona_pending.extend(ordered_persona)
+            else:
+                self._persona_pending.append(message)
+            persona_cutoff = (
+                message.sent_at - self.config.persona_increment_max_hours * 7200
+            )
+            while self._persona_pending and self._persona_pending[0].sent_at < persona_cutoff:
+                self._persona_pending.popleft()
+            while len(self._persona_pending) > 20_000:
+                self._persona_pending.popleft()
 
     def _prune_group(self, group_id: str, now: float) -> None:
         """移除三小时前或超过配置条数的消息。"""
@@ -732,30 +764,44 @@ class ReplyWillingnessEngine:
             )
             processed_at = float(persona_state.get("last_source_message_at") or 0)
             profile_updated_at = float(persona_state.get("updated_at") or 0)
-            update_interval = self.config.topic_analysis_min_hours * 3600
+            # 使用人格专属队列而不是三小时群流，低活跃时也能满足 24 小时更新策略。
             persona_items = sorted(
-                (
-                    item
-                    for group_id in self._messages
-                    for item in self.messages(group_id, now)
-                    if item.user_id == self.config.persona_user_id
-                    and item.sent_at > processed_at
-                    and item.text
-                ),
+                (item for item in self._persona_pending if item.sent_at > processed_at),
                 key=lambda item: item.sent_at,
             )
-            if persona_items and now - profile_updated_at >= update_interval:
+            enough_volume = len(persona_items) >= self.config.persona_increment_min_messages
+            due_by_age = (
+                len(persona_items) >= self.config.persona_increment_floor_messages
+                and now - profile_updated_at
+                >= self.config.persona_increment_max_hours * 3600
+            )
+            if enough_volume or due_by_age:
                 try:
+                    # 单批最多 200 条，确保不会因模型上下文上限跳过后仍错误推进游标。
+                    analysis_items = persona_items[:200]
                     profile = await analyzer.analyze_persona(
-                        [item.text for item in persona_items],
+                        [item.text for item in analysis_items],
                         {},
                         self.config.personal_background,
                         now,
                     )
+                    # 已激活的结构化画像作为历史证据参与合并；少量新消息不会覆盖旧人格。
+                    if persona_state.get("active_version") and persona_state.get("dimensions"):
+                        profile = merge_persona_profiles(
+                            [persona_state, profile],
+                            group_weight=self.config.persona_group_style_weight,
+                        )
                     # 存储层使用真实最新源消息时间，而不是信任模型生成游标。
-                    profile["last_source_message_at"] = persona_items[-1].sent_at
-                    self.store.save_persona_profile(
-                        self.config.persona_user_id, profile, now
+                    profile["last_source_message_at"] = analysis_items[-1].sent_at
+                    self.store.save_persona_version(
+                        self.config.persona_user_id,
+                        profile,
+                        now,
+                        # 已有经确认版本时才自动激活渐进更新；首次画像保持草稿。
+                        activate=bool(persona_state.get("active_version")),
                     )
+                    processed_at = analysis_items[-1].sent_at
+                    while self._persona_pending and self._persona_pending[0].sent_at <= processed_at:
+                        self._persona_pending.popleft()
                 except Exception:  # noqa: BLE001
                     logger.exception("意愿模块个人背景增量更新失败，继续使用旧背景")

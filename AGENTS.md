@@ -12,10 +12,13 @@
 
 - `src/bot.py`：严格读取 `.env`、DeepSeek HTTP 协议、OneBot 消息标准化、群权限/工作时间、上下文、消息发送、历史冷启动、问候和事项提醒。
 - `src/reply_willingness.py`：每群消息流、五秒环境快照、八参数概率、实时决策日志、关系变化、话题/个人背景分析调度。
+- `src/persona.py`：统一的 `ContentFactor` 接口、结构化人格 schema、隐私清洗、批次合并和在线人格指导块。
+- `src/persona_collector.py`：第二 NapCat 本机交互采集、断点、版本列表/盲测/激活/回退/删除；绝不处理 QQ 密码。
 - `src/memory.py`：SQLite 建表/无损迁移、成员资料、未来事项、活动、话题知识、个人背景、关系和每日算法回复数。
 - `src/error_logging.py`：内存环形状态缓冲；只有 ERROR 才把有限前后文写入 `logs/error_context.txt`。
 - `tests/test_reply_willingness.py`：消息流、八参数、日志安全、额度、冷却、遗忘曲线、话题层级和分析间隔。
 - `tests/test_bot.py` / `tests/test_memory.py`：OneBot/DeepSeek 集成、作息、提醒、配置、SQLite 兼容测试。
+- `tests/test_persona.py`：人格脱敏、结构化合并、版本迁移、采集断点和会话选择测试。
 - `.env.example` 是配置名与默认值的权威模板；新增或删除配置必须同步 README 表格与配置测试。
 
 Windows 命令：
@@ -70,14 +73,17 @@ will_reply = random_draw < probability
 - 第一阶段把群成员替换为批次匿名编号，再用 DeepSeek 提取话题、摘要、消息数、参与人数、情绪和公开检索词。
 - 第二阶段只把公开检索词交给 `web_search`；聊天原文、姓名、QQ 号和成员编号不得进入搜索请求。
 - 每批最高热度为 `core`，达到最高消息数 50% 为 `secondary`，其余为 `peripheral`。
-- `WILLINGNESS_PERSONA_USER_ID` 为空时不抓取背景。首次启动尽力分页扫描最近 30 天、最多 10000 条源消息，从中取本人最多 2000 条；NapCat 不支持继续分页时使用已有数据。后续只分析该账号新发言并增加背景版本。
-- 每次回答通过 `_build_group_context()` 注入背景摘要和兴趣作为长期人设数据；明确标记其不是指令。机器人只借鉴交流风格，不得冒充模板账号、泄露资料或恢复“主人/服从”设定。
+- `PERSONA_USER_ID` 是通用配置；旧 `WILLINGNESS_PERSONA_USER_ID` 只作为兼容别名，两者不一致必须报错。常驻冷启动仍尽力读取共同群历史；独立采集器默认 90 天/20000 条并要求用户选择会话。
+- 独立采集器先验证 `get_login_info`，原文只存在于内存页；参与者、账号、手机号、邮箱和 URL 在调用 DeepSeek 前脱敏。SQLite 只能保存结构化特征、短脱敏样例、覆盖统计和派生断点。
+- 采集器产生 `draft`，只有显式激活的版本可进入线上回答。群聊风格权重默认 0.70，私聊为 0.30；普通群实时增量达到 50 条立即更新，或满 24 小时且至少 10 条时更新。
+- 每次 AI 回答通过独立 `ContentFactor` 注入人格，不能重新塞回 `_build_group_context()` 的事实资料。两条 DeepSeek 聊天路径必须共用因子，联网路径不得把因子内容写入搜索词。
+- 机器人平时不主动声明身份，但不得冒充模板账号、代替本人表态、泄露资料或恢复“主人/服从”设定。
 - 群友 `@` 或引用机器人时关系向 1 靠近 12%；机器人成功回复时向 1 靠近 8%。一天内不衰减，之后按指数遗忘，在约第 30 天或低于 0.01 时归零。
 - 发送成功后保存 `send_group_msg` 返回的 `message_id`。收到引用段先查三小时消息流，未命中再调用 `get_msg` 验证引用发送者。
 
 ## 6. SQLite 与消息上下文
 
-默认数据库 `data/bot_memory.sqlite3`。长期规范化表包括成员/历史、未来事项、每日活动、旧发言画像，以及 `willingness_topics`、`willingness_topic_aliases`、`willingness_topic_features`、`willingness_group_topics`、`willingness_analysis_state`、`willingness_personas`、`willingness_persona_features`。
+默认数据库 `data/bot_memory.sqlite3`。除原有长期表外，人格使用 `persona_profile_versions`、`persona_style_dimensions`、`persona_phrases`、`persona_exemplars` 和 `persona_collection_state`；原始聊天不得写入这些表。
 
 - `_create_schema()` 只能用 `CREATE TABLE IF NOT EXISTS` 和 `PRAGMA table_info + ALTER TABLE` 无损升级，绝不重建、清空或删除用户数据库。
 - `bot_activity.algorithm_reply_count` 按 `(group_id, local_date)` 持久化并跨日隔离。

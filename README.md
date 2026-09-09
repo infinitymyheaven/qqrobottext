@@ -9,6 +9,7 @@
 - 群友改名、身份变化或退群后保留历史记录，不受模型上下文长度影响。
 - 每天 10:00–19:00 工作；包括 `@` 在内的候选消息都由多因素概率算法决定是否回答。
 - 独立意愿模块维护每群三小时消息流；普通消息与 `@` 都经过概率判断并共享每日 500 条上限。
+- 结构化人格内容模块学习模板账号的语气、句式、幽默、互动习惯和常用短语，并通过可回退版本控制影响 DeepSeek 的回答方式。
 - 自动识别未来事项、持久化保存并在到期前提醒。
 - 普通群聊默认只保留最近五分钟的临时上下文，不永久保存全部聊天内容。
 
@@ -78,9 +79,9 @@ FUTURE_MEMORY_SOURCE=active_window_all
 - 启动、重连和每 6 小时通过 NapCat 全量同步群成员。
 - 成员加入、退出、管理员或群名片变化后自动刷新对应群。
 - 当前资料与变更历史均保留；退群成员标记为非活跃而不删除。
-- 话题知识、每群话题热度、个人背景版本、社会关系和每日算法回复数使用规范化 SQLite 表长期保存；普通消息流本身只在内存保存，重启可丢失。
-- 目标账号通过本机 `.env` 的 `WILLINGNESS_PERSONA_USER_ID` 设置。首次启动尽力读取最近 30 天、最多 2000 条本人消息生成背景，之后按新发言增量更新；目标 QQ 号不要写入代码或提交。
-- 提炼出的背景摘要和兴趣不仅参与消息相关性计算，也会作为每次回答的长期人设参考。机器人只借鉴表达习惯和兴趣，不冒充模板账号、不透露其资料，也不会把群主或任何成员称为“主人”。
+- 话题知识、每群话题热度、结构化人格版本、社会关系和每日算法回复数使用规范化 SQLite 表长期保存；普通消息流本身只在内存保存，重启可丢失。
+- 模板账号通过本机 `.env` 的 `PERSONA_USER_ID` 设置；旧 `WILLINGNESS_PERSONA_USER_ID` 仅保留兼容。目标 QQ 号不要写入代码或提交。
+- 当前激活的人格版本同时提供意愿相关性向量和回答内容因子。机器人高相似地借鉴表达习惯和兴趣，但不冒充模板账号、不代替本人表态、不透露采集资料，也不会把群主或任何成员称为“主人”。
 - 群友 `@` 或引用机器人时，关系向 1 靠近 12%；机器人成功回复时向 1 靠近 8%。一天内不衰减，之后按指数曲线遗忘，在约 30 天归零。
 - AI 每次只读取当前发言者、群主/管理员、被 @ 或问题中明确提到的成员，匹配数量可配置，避免把大群名册塞进每次请求。
 - 最近群聊默认保留 5 分钟、最多 20 条、每条最多 300 字；逐成员对话默认保留 10 条，闲置 30 分钟后清空。
@@ -89,6 +90,28 @@ FUTURE_MEMORY_SOURCE=active_window_all
 - 未确认时会随机等待 2–5 小时准备二次 @；事项已经过期则取消二次提醒。
 
 `data/`、`.env`、QQ 数据和虚拟环境均被 Git 忽略。数据库包含群成员资料，备份或分享项目时不要复制该目录。
+
+## 结构化人格采集与版本管理
+
+常驻机器人只能持续看到双方共同白名单群里的模板账号新发言。如需使用更丰富的历史，在另一个 NapCat 实例中由账号本人扫码登录，并把正向 WebSocket 端口设为 `3002`。不要把 QQ 密码发给程序、AI 或写入 `.env`。
+
+采集器连接后先核对登录账号，再在本机终端列出群聊和好友供你选择。默认尽力扫描最近 90 天、最多 20000 条模板账号文字，并为每条本人发言保留此前最多三条、此后一条脱敏上下文。完整原文只存在于当前内存批次；DeepSeek 只收到去标识文本，不使用 `web_search`，SQLite 只保存结构化特征、短脱敏样例和断点统计。
+
+```powershell
+# 生成草稿；Token 会在终端中隐藏输入。
+.venv\Scripts\python.exe src\persona_collector.py collect
+
+# 查看版本并生成 20 组新旧回复盲测。
+.venv\Scripts\python.exe src\persona_collector.py list
+.venv\Scripts\python.exe src\persona_collector.py compare 2
+
+# 盲测确认后激活；也可回退或彻底删除派生数据。
+.venv\Scripts\python.exe src\persona_collector.py activate 2
+.venv\Scripts\python.exe src\persona_collector.py rollback
+.venv\Scripts\python.exe src\persona_collector.py delete
+```
+
+采集器生成的版本默认是 `draft`，不会影响线上机器人。激活或回退后重启机器人生效。NapCat 历史受本机缓存和版本差异影响，命令会报告实际覆盖范围及重复页、离线缺口等情况；`--restart` 可忽略旧断点重新采集。
 
 ## 安装
 
@@ -125,7 +148,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 `deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通问题由模型判断是否联网，明确要求搜索时强制联网核验。天气、新闻等实时信息和本地未来事项中没有记录的外部事件均可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
 
-默认 `DEEPSEEK_SYSTEM_PROMPT` 将机器人定义为群内平等、自然且有分寸的群友。每次回答还会从 SQLite 注入 `WILLINGNESS_PERSONA_USER_ID` 对应的最新背景摘要作为风格模板；背景内容按描述性数据处理，不能覆盖系统规则。
+默认 `DEEPSEEK_SYSTEM_PROMPT` 将机器人定义为群内平等、自然且有分寸的群友。每次 AI 回答会在事实资料之外单独注入当前激活的结构化人格内容因子；普通 Chat Completions 与联网 Responses 两条路径共用同一因子，因子不得进入搜索词，也不能覆盖系统规则。
 
 “现在几点”“当前时间”等本地时间问题直接使用机器人已经持有的带时区时钟回答，不调用 DeepSeek，也不依赖 `web_search`。这样既更快，也不会因为模型没有执行搜索工具而误报联网失败；询问其他地区时间等需要外部判断的问题仍交给模型处理。
 
@@ -158,8 +181,11 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `WILLINGNESS_SHORT_WINDOW_SECONDS` | `600` | 群活跃度的近期主窗口 |
 | `WILLINGNESS_SHORT_FULL_MESSAGES` / `WILLINGNESS_OLD_FULL_MESSAGES` | `30` / `120` | 近期和较早消息密度达到满分的尺度 |
 | `WILLINGNESS_TOPIC_ANALYSIS_MIN_HOURS` / `WILLINGNESS_TOPIC_ANALYSIS_MAX_HOURS` | `3` / `10` | 每群 AI 话题分析间隔边界 |
-| `WILLINGNESS_PERSONA_USER_ID` | 空 | 需要构建个人背景的目标 QQ 号；只填写到本机 `.env` |
+| `PERSONA_USER_ID` | 空 | 模板账号；只填写到本机 `.env`，旧 `WILLINGNESS_PERSONA_USER_ID` 仅兼容 |
 | `WILLINGNESS_PERSONAL_BACKGROUND` | 内置通用背景 | 无历史资料时使用的本地相关性种子 |
+| `PERSONA_CONTENT_ENABLED` / `PERSONA_GROUP_STYLE_WEIGHT` | `true` / `0.70` | 是否向 AI 注入人格内容因子，以及群聊相对私聊的风格权重 |
+| `PERSONA_INCREMENT_MIN_MESSAGES` | `50` | 共同白名单群内累计到多少条模板发言后立即更新人格 |
+| `PERSONA_INCREMENT_MAX_HOURS` / `PERSONA_INCREMENT_FLOOR_MESSAGES` | `24` / `10` | 未达到立即更新阈值时的最长等待时间和最少消息数 |
 | `WILLINGNESS_HISTORY_DAYS` | `30` | 首次个人背景历史时间范围 |
 | `WILLINGNESS_HISTORY_MESSAGE_LIMIT` / `WILLINGNESS_HISTORY_SCAN_LIMIT` | `2000` / `10000` | 最多收集的本人消息数和最多扫描的源消息数 |
 | `WILLINGNESS_BOND_INBOUND_RATE` / `WILLINGNESS_BOND_OUTBOUND_RATE` | `0.12` / `0.08` | 群友与机器人双向互动时关系向 1 靠近的比例 |

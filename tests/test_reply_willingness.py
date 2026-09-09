@@ -221,6 +221,51 @@ class ReplyWillingnessTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.store.list_willingness_topics("g")[0]["name"], "旧知识")
 
+    async def test_persona_increment_survives_three_hour_willingness_window(self):
+        config = WillingnessConfig(
+            persona_user_id="target",
+            persona_increment_min_messages=50,
+            persona_increment_max_hours=24,
+            persona_increment_floor_messages=2,
+        )
+        self.store.save_persona_profile(
+            "target",
+            {"summary": "旧人格", "interests": [], "last_source_message_at": self.now - 25 * 3600},
+            self.now - 25 * 3600,
+        )
+        engine = ReplyWillingnessEngine(config, self.store, rng=SequenceRNG())
+        for index in range(2):
+            engine.record_message(
+                StreamMessage(
+                    "g",
+                    "target",
+                    "模板",
+                    self.now - 20 * 3600 + index,
+                    f"低频发言 {index}",
+                )
+            )
+
+        calls = []
+
+        class Analyzer:
+            async def analyze_willingness_topics(_self, messages, now):
+                return []
+
+            async def enrich_willingness_topics(_self, queries, now):
+                return {}
+
+            async def analyze_persona(_self, messages, metadata, seed, now):
+                calls.append(list(messages))
+                return {"summary": "低频但稳定", "interests": []}
+
+        # 三小时意愿流已为空，但人格专属队列仍保留这两条二十小时前的消息。
+        self.assertEqual(engine.messages("g", self.now), ())
+        await engine.analyze_due_groups(Analyzer(), self.now)
+        self.assertEqual(calls, [["低频发言 0", "低频发言 1"]])
+        self.assertEqual(
+            self.store.get_persona_profile("target", "")["summary"], "低频但稳定"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import sqlite3
@@ -213,6 +214,83 @@ class MemoryStore:
                 FOREIGN KEY (user_id) REFERENCES willingness_personas(user_id)
                     ON DELETE CASCADE
             );
+
+            -- 每次提炼生成不可变版本；只有显式激活的版本进入线上回答。
+            CREATE TABLE IF NOT EXISTS persona_profile_versions (
+                user_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'draft',
+                summary TEXT NOT NULL DEFAULT '',
+                interests TEXT NOT NULL DEFAULT '',
+                source_started_at REAL NOT NULL DEFAULT 0,
+                source_ended_at REAL NOT NULL DEFAULT 0,
+                source_message_count INTEGER NOT NULL DEFAULT 0,
+                group_message_count INTEGER NOT NULL DEFAULT 0,
+                private_message_count INTEGER NOT NULL DEFAULT 0,
+                coverage_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                PRIMARY KEY (user_id, version),
+                FOREIGN KEY (user_id) REFERENCES willingness_personas(user_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_style_dimensions (
+                user_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                scene TEXT NOT NULL,
+                score REAL NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, version, name, scene),
+                FOREIGN KEY (user_id, version)
+                    REFERENCES persona_profile_versions(user_id, version)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_phrases (
+                user_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                phrase TEXT NOT NULL,
+                scene TEXT NOT NULL,
+                frequency INTEGER NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, version, phrase, scene),
+                FOREIGN KEY (user_id, version)
+                    REFERENCES persona_profile_versions(user_id, version)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_exemplars (
+                user_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                exemplar_order INTEGER NOT NULL,
+                scene TEXT NOT NULL,
+                situation TEXT NOT NULL DEFAULT '',
+                response TEXT NOT NULL,
+                PRIMARY KEY (user_id, version, exemplar_order),
+                FOREIGN KEY (user_id, version)
+                    REFERENCES persona_profile_versions(user_id, version)
+                    ON DELETE CASCADE
+            );
+
+            -- 断点只保存游标、覆盖统计和模型派生画像，绝不保存原始会话。
+            CREATE TABLE IF NOT EXISTS persona_collection_state (
+                user_id TEXT NOT NULL,
+                conversation_key TEXT NOT NULL,
+                conversation_type TEXT NOT NULL,
+                cursor TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                oldest_at REAL NOT NULL DEFAULT 0,
+                newest_at REAL NOT NULL DEFAULT 0,
+                scanned_count INTEGER NOT NULL DEFAULT 0,
+                processed_hashes_json TEXT NOT NULL DEFAULT '[]',
+                derived_profile_json TEXT NOT NULL DEFAULT '{}',
+                completed INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, conversation_key)
+            );
             """
         )
         activity_columns = {
@@ -225,6 +303,22 @@ class MemoryStore:
         if "algorithm_reply_count" not in activity_columns:
             self.conn.execute(
                 "ALTER TABLE bot_activity ADD COLUMN algorithm_reply_count INTEGER NOT NULL DEFAULT 0"
+            )
+        persona_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(willingness_personas)")
+        }
+        if "active_version" not in persona_columns:
+            self.conn.execute(
+                "ALTER TABLE willingness_personas ADD COLUMN active_version INTEGER NOT NULL DEFAULT 0"
+            )
+        collection_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(persona_collection_state)")
+        }
+        if "processed_hashes_json" not in collection_columns:
+            self.conn.execute(
+                "ALTER TABLE persona_collection_state ADD COLUMN processed_hashes_json TEXT NOT NULL DEFAULT '[]'"
             )
         self.conn.commit()
 
@@ -845,53 +939,374 @@ class MemoryStore:
         norm = math.sqrt(sum(value * value for value in counts.values()))
         return {feature_id: value / norm for feature_id, value in counts.items()}
 
-    def get_persona_profile(self, user_id: str, fallback: str) -> dict:
-        """读取个人背景；尚未生成时使用 .env 种子并即时构造向量。"""
+    def get_persona_profile(
+        self, user_id: str, fallback: str, *, version: int | None = None
+    ) -> dict:
+        """读取当前激活或指定人格版本，并继续提供意愿模块所需向量。"""
         row = self.conn.execute(
             "SELECT * FROM willingness_personas WHERE user_id=?", (str(user_id),)
         ).fetchone()
         if not row:
-            return {"summary": fallback, "interests": "", "features": self._text_vector(fallback)}
+            return {
+                "summary": fallback,
+                "interests": [],
+                "features": self._text_vector(fallback),
+                "version": 0,
+                "active_version": 0,
+                "dimensions": [],
+                "phrases": [],
+                "exemplars": [],
+            }
         profile = dict(row)
-        profile["features"] = self._read_feature_rows(
+        selected_version = int(version if version is not None else profile.get("active_version") or 0)
+        if selected_version:
+            version_row = self.conn.execute(
+                """SELECT * FROM persona_profile_versions
+                   WHERE user_id=? AND version=?""",
+                (str(user_id), selected_version),
+            ).fetchone()
+            if version_row:
+                profile.update(dict(version_row))
+                profile["interests"] = [
+                    item for item in str(version_row["interests"]).split("、") if item
+                ]
+                profile["dimensions"] = [
+                    dict(item)
+                    for item in self.conn.execute(
+                        """SELECT name, scene, score, description, confidence, evidence_count
+                           FROM persona_style_dimensions
+                           WHERE user_id=? AND version=? ORDER BY confidence DESC, name""",
+                        (str(user_id), selected_version),
+                    )
+                ]
+                profile["phrases"] = [
+                    {
+                        "text": item["phrase"],
+                        "scene": item["scene"],
+                        "frequency": item["frequency"],
+                        "confidence": item["confidence"],
+                    }
+                    for item in self.conn.execute(
+                        """SELECT phrase, scene, frequency, confidence
+                           FROM persona_phrases WHERE user_id=? AND version=?
+                           ORDER BY frequency DESC, phrase""",
+                        (str(user_id), selected_version),
+                    )
+                ]
+                profile["exemplars"] = [
+                    dict(item)
+                    for item in self.conn.execute(
+                        """SELECT situation, response, scene FROM persona_exemplars
+                           WHERE user_id=? AND version=? ORDER BY exemplar_order""",
+                        (str(user_id), selected_version),
+                    )
+                ]
+                profile["coverage"] = json.loads(version_row["coverage_json"] or "{}")
+        else:
+            has_drafts = self.conn.execute(
+                "SELECT 1 FROM persona_profile_versions WHERE user_id=? LIMIT 1",
+                (str(user_id),),
+            ).fetchone()
+            # 新系统中的未激活草稿不能影响线上；没有版本行的才是旧 schema 画像。
+            if has_drafts:
+                profile["summary"] = fallback
+                profile["interests"] = []
+            else:
+                profile["interests"] = [
+                    item for item in str(profile.get("interests") or "").split("、") if item
+                ]
+            profile.update({"dimensions": [], "phrases": [], "exemplars": []})
+        features = self._read_feature_rows(
             "willingness_persona_features", "user_id", str(user_id)
         )
+        profile["features"] = features or self._text_vector(str(profile.get("summary") or fallback))
         return profile
 
     def save_persona_profile(
         self, user_id: str, profile: dict, updated_at: float
     ) -> None:
-        """保存模型精炼后的个人背景并更新稀疏向量和版本号。"""
+        """兼容旧调用：保存并立即激活一个画像版本。"""
+        self.save_persona_version(user_id, profile, updated_at, activate=True)
+
+    def save_persona_version(
+        self,
+        user_id: str,
+        profile: dict,
+        updated_at: float,
+        *,
+        activate: bool = False,
+    ) -> int:
+        """保存不可变结构化画像；采集器默认生成草稿，线上更新可立即激活。"""
+        uid = str(user_id)
         summary = " ".join(str(profile.get("summary") or "").split())[:2000]
         interests_raw = profile.get("interests") or []
-        interests = "、".join(str(item) for item in interests_raw) if isinstance(interests_raw, list) else str(interests_raw)
+        interests = (
+            "、".join(" ".join(str(item).split())[:40] for item in interests_raw)
+            if isinstance(interests_raw, list)
+            else str(interests_raw)
+        )[:1000]
         if not summary:
-            return
+            raise ValueError("人格画像 summary 不能为空")
         source_at = float(profile.get("last_source_message_at") or updated_at)
         with self.conn:
+            existing = self.conn.execute(
+                """SELECT version, active_version, summary, interests
+                   FROM willingness_personas WHERE user_id=?""",
+                (uid,),
+            ).fetchone()
+            next_version = int(existing["version"] if existing else 0) + 1
+            active_version = int(existing["active_version"] if existing else 0)
             self.conn.execute(
                 """INSERT INTO willingness_personas
-                       (user_id, summary, interests, version, last_source_message_at, updated_at)
-                   VALUES (?, ?, ?, 1, ?, ?)
+                       (user_id, summary, interests, version, last_source_message_at,
+                        updated_at, active_version)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(user_id) DO UPDATE SET
-                       summary=excluded.summary,
-                       interests=excluded.interests,
-                       version=willingness_personas.version+1,
+                       summary=CASE WHEN excluded.active_version>0
+                           THEN excluded.summary ELSE willingness_personas.summary END,
+                       interests=CASE WHEN excluded.active_version>0
+                           THEN excluded.interests ELSE willingness_personas.interests END,
+                       version=excluded.version,
                        last_source_message_at=MAX(
                            willingness_personas.last_source_message_at,
                            excluded.last_source_message_at),
-                       updated_at=excluded.updated_at""",
-                (str(user_id), summary, interests[:1000], source_at, updated_at),
+                       updated_at=excluded.updated_at,
+                       active_version=CASE WHEN excluded.active_version>0
+                           THEN excluded.active_version ELSE willingness_personas.active_version END""",
+                (
+                    uid,
+                    summary if activate else str(existing["summary"] if existing else ""),
+                    interests if activate else str(existing["interests"] if existing else ""),
+                    next_version,
+                    source_at,
+                    updated_at,
+                    next_version if activate else active_version,
+                ),
             )
             self.conn.execute(
-                "DELETE FROM willingness_persona_features WHERE user_id=?", (str(user_id),)
+                """INSERT INTO persona_profile_versions
+                       (user_id, version, status, summary, interests,
+                        source_started_at, source_ended_at, source_message_count,
+                        group_message_count, private_message_count, coverage_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uid,
+                    next_version,
+                    "active" if activate else "draft",
+                    summary,
+                    interests,
+                    float(profile.get("source_started_at") or 0),
+                    float(profile.get("source_ended_at") or source_at),
+                    int(profile.get("source_message_count") or 0),
+                    int(profile.get("group_message_count") or 0),
+                    int(profile.get("private_message_count") or 0),
+                    json.dumps(profile.get("coverage") or {}, ensure_ascii=False, sort_keys=True),
+                    updated_at,
+                ),
+            )
+            if activate:
+                self.conn.execute(
+                    """UPDATE persona_profile_versions SET status='archived'
+                       WHERE user_id=? AND version<>? AND status='active'""",
+                    (uid, next_version),
+                )
+            dimensions = [item for item in profile.get("dimensions") or [] if isinstance(item, dict)]
+            self.conn.executemany(
+                """INSERT INTO persona_style_dimensions
+                       (user_id, version, name, scene, score, description,
+                        confidence, evidence_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        uid,
+                        next_version,
+                        str(item.get("name") or "")[:40],
+                        str(item.get("scene") or "all")[:16],
+                        min(1.0, max(0.0, float(item.get("score") or 0))),
+                        " ".join(str(item.get("description") or "").split())[:240],
+                        min(1.0, max(0.0, float(item.get("confidence") or 0))),
+                        max(0, int(item.get("evidence_count") or 0)),
+                    )
+                    for item in dimensions
+                    if item.get("name")
+                ],
+            )
+            phrases = [item for item in profile.get("phrases") or [] if isinstance(item, dict)]
+            self.conn.executemany(
+                """INSERT INTO persona_phrases
+                       (user_id, version, phrase, scene, frequency, confidence)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        uid,
+                        next_version,
+                        " ".join(str(item.get("text") or "").split())[:40],
+                        str(item.get("scene") or "all")[:16],
+                        max(0, int(item.get("frequency") or 0)),
+                        min(1.0, max(0.0, float(item.get("confidence") or 0))),
+                    )
+                    for item in phrases
+                    if item.get("text")
+                ],
+            )
+            exemplars = [item for item in profile.get("exemplars") or [] if isinstance(item, dict)]
+            self.conn.executemany(
+                """INSERT INTO persona_exemplars
+                       (user_id, version, exemplar_order, scene, situation, response)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        uid,
+                        next_version,
+                        index,
+                        str(item.get("scene") or "group")[:16],
+                        " ".join(str(item.get("situation") or "").split())[:80],
+                        " ".join(str(item.get("response") or "").split())[:100],
+                    )
+                    for index, item in enumerate(exemplars[:200])
+                    if item.get("response")
+                ],
+            )
+            if not activate:
+                return next_version
+            self.conn.execute(
+                "DELETE FROM willingness_persona_features WHERE user_id=?", (uid,)
             )
             vector = self._text_vector(f"{summary} {interests}")
             self.conn.executemany(
                 """INSERT INTO willingness_persona_features(user_id, feature_id, value)
                    VALUES (?, ?, ?)""",
-                [(str(user_id), feature_id, value) for feature_id, value in vector.items()],
+                [(uid, feature_id, value) for feature_id, value in vector.items()],
             )
+        return next_version
+
+    def list_persona_versions(self, user_id: str) -> list[dict]:
+        """列出本地画像版本，不包含脱敏样例正文。"""
+        return [
+            dict(row)
+            for row in self.conn.execute(
+                """SELECT version, status, source_started_at, source_ended_at,
+                          source_message_count, group_message_count,
+                          private_message_count, created_at
+                   FROM persona_profile_versions WHERE user_id=? ORDER BY version DESC""",
+                (str(user_id),),
+            )
+        ]
+
+    def activate_persona_version(self, user_id: str, version: int) -> None:
+        """原子激活指定版本，并同步意愿算法使用的相关性向量。"""
+        uid = str(user_id)
+        row = self.conn.execute(
+            "SELECT summary, interests FROM persona_profile_versions WHERE user_id=? AND version=?",
+            (uid, int(version)),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"人格版本不存在：{version}")
+        with self.conn:
+            self.conn.execute(
+                "UPDATE persona_profile_versions SET status='archived' WHERE user_id=? AND status='active'",
+                (uid,),
+            )
+            self.conn.execute(
+                "UPDATE persona_profile_versions SET status='active' WHERE user_id=? AND version=?",
+                (uid, int(version)),
+            )
+            self.conn.execute(
+                """UPDATE willingness_personas SET summary=?, interests=?,
+                          active_version=?,
+                          updated_at=MAX(updated_at, CAST(strftime('%s','now') AS REAL))
+                   WHERE user_id=?""",
+                (row["summary"], row["interests"], int(version), uid),
+            )
+            self.conn.execute("DELETE FROM willingness_persona_features WHERE user_id=?", (uid,))
+            vector = self._text_vector(f"{row['summary']} {row['interests']}")
+            self.conn.executemany(
+                "INSERT INTO willingness_persona_features(user_id, feature_id, value) VALUES (?, ?, ?)",
+                [(uid, feature_id, value) for feature_id, value in vector.items()],
+            )
+
+    def rollback_persona_version(self, user_id: str) -> int:
+        """回退到当前激活版本之前最近的版本。"""
+        uid = str(user_id)
+        row = self.conn.execute(
+            "SELECT active_version FROM willingness_personas WHERE user_id=?", (uid,)
+        ).fetchone()
+        active = int(row["active_version"] if row else 0)
+        previous = self.conn.execute(
+            """SELECT MAX(version) AS version FROM persona_profile_versions
+               WHERE user_id=? AND version<? AND status='archived'""",
+            (uid, active),
+        ).fetchone()
+        version = int(previous["version"] or 0)
+        if not version:
+            raise ValueError("没有可回退的人格版本")
+        self.activate_persona_version(uid, version)
+        return version
+
+    def delete_persona_data(self, user_id: str) -> None:
+        """按用户删除画像、派生样例和采集断点；不影响其他机器人记忆。"""
+        uid = str(user_id)
+        with self.conn:
+            self.conn.execute("DELETE FROM persona_collection_state WHERE user_id=?", (uid,))
+            self.conn.execute("DELETE FROM willingness_personas WHERE user_id=?", (uid,))
+
+    def get_persona_collection_state(self, user_id: str, conversation_key: str) -> dict:
+        row = self.conn.execute(
+            """SELECT * FROM persona_collection_state
+               WHERE user_id=? AND conversation_key=?""",
+            (str(user_id), str(conversation_key)),
+        ).fetchone()
+        if not row:
+            return {}
+        value = dict(row)
+        try:
+            value["derived_profile"] = json.loads(value.pop("derived_profile_json") or "{}")
+        except json.JSONDecodeError:
+            value["derived_profile"] = {}
+        try:
+            value["processed_hashes"] = json.loads(
+                value.pop("processed_hashes_json") or "[]"
+            )
+        except json.JSONDecodeError:
+            value["processed_hashes"] = []
+        return value
+
+    def save_persona_collection_state(
+        self, user_id: str, conversation_key: str, state: dict
+    ) -> None:
+        """保存可恢复断点；调用方只能传模型派生画像，不能传原始消息。"""
+        derived = state.get("derived_profile") or {}
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO persona_collection_state
+                       (user_id, conversation_key, conversation_type, cursor,
+                        fingerprint, oldest_at, newest_at, scanned_count,
+                        processed_hashes_json, derived_profile_json, completed, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, conversation_key) DO UPDATE SET
+                       conversation_type=excluded.conversation_type,
+                       cursor=excluded.cursor, fingerprint=excluded.fingerprint,
+                       oldest_at=excluded.oldest_at, newest_at=excluded.newest_at,
+                       scanned_count=excluded.scanned_count,
+                       processed_hashes_json=excluded.processed_hashes_json,
+                       derived_profile_json=excluded.derived_profile_json,
+                       completed=excluded.completed, updated_at=excluded.updated_at""",
+                (
+                    str(user_id),
+                    str(conversation_key),
+                    str(state.get("conversation_type") or "group"),
+                    str(state.get("cursor") or ""),
+                    str(state.get("fingerprint") or ""),
+                    float(state.get("oldest_at") or 0),
+                    float(state.get("newest_at") or 0),
+                    int(state.get("scanned_count") or 0),
+                    json.dumps(list(state.get("processed_hashes") or [])[-50_000:]),
+                    json.dumps(derived, ensure_ascii=False, sort_keys=True),
+                    int(bool(state.get("completed"))),
+                    float(state.get("updated_at") or 0),
+                ),
+            )
+
     def record_bot_message(
         self,
         group_id: str | int,

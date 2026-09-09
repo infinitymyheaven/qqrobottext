@@ -28,6 +28,7 @@ from src.bot import (
     text_feature_vector,
 )
 from src.memory import MemoryStore
+from src.persona import ContentFactor, PersonaContentEngine, PersonaSample
 from src.reply_willingness import StreamMessage
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -86,8 +87,8 @@ class FakeLLM:
         self.persona_calls = []
         self.events = events or []
 
-    async def chat(self, history, user_text, *, context="", now=None):
-        self.chat_calls.append((list(history), user_text, context, now))
+    async def chat(self, history, user_text, *, context="", content_factors=(), now=None):
+        self.chat_calls.append((list(history), user_text, context, now, tuple(content_factors)))
         return f"AI:{user_text}"
 
     async def extract_future_events(self, text, now):
@@ -106,7 +107,7 @@ class FakeLLM:
 
 
 class FailingWebLLM(FakeLLM):
-    async def chat(self, history, user_text, *, context="", now=None):
+    async def chat(self, history, user_text, *, context="", content_factors=(), now=None):
         raise DeepSeekWebSearchError("模拟联网失败")
 
 
@@ -192,10 +193,57 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             "test-key", model="test-model", timeout_seconds=12, web_search_enabled=False
         )
         with patch("src.bot.urlopen", fake_urlopen):
-            answer = await client.chat([], "谁是群主", context="张三是群主")
+            answer = await client.chat(
+                [],
+                "谁是群主",
+                context="张三是群主",
+                content_factors=(ContentFactor("persona", 2, 0.8, "说话简短"),),
+            )
         self.assertEqual(answer, "回复")
-        self.assertIn("张三是群主", captured["body"]["messages"][1]["content"])
+        self.assertIn("说话简短", captured["body"]["messages"][1]["content"])
+        self.assertIn("张三是群主", captured["body"]["messages"][2]["content"])
         self.assertEqual(captured["timeout"], 12)
+
+    async def test_persona_analysis_sanitizes_identifiers_and_never_uses_web(self):
+        captured = {}
+        result = {
+            "summary": "表达直接",
+            "interests": ["游戏"],
+            "dimensions": [],
+            "phrases": [],
+            "exemplars": [],
+        }
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(
+                {"choices": [{"message": {"content": json.dumps(result, ensure_ascii=False)}}]}
+            )
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen):
+            analyzed = await client.analyze_persona_samples(
+                [
+                    PersonaSample(
+                        "联系我 13800138000 QQ 123456789",
+                        "网址 https://example.com",
+                        "private",
+                        100,
+                    )
+                ],
+                public_metadata={"user_id": "123456789", "nickname": "真实昵称", "age": 20},
+                seed_background="后备",
+                now=200,
+            )
+        serialized = json.dumps(captured["body"], ensure_ascii=False)
+        self.assertTrue(captured["url"].endswith("/chat/completions"))
+        self.assertNotIn("tools", captured["body"])
+        self.assertNotIn("13800138000", serialized)
+        self.assertNotIn("123456789", serialized)
+        self.assertNotIn("真实昵称", serialized)
+        self.assertNotIn("example.com", serialized)
+        self.assertEqual(analyzed["private_message_count"], 1)
 
     async def test_web_chat_uses_responses_auto_and_sanitizes_context(self):
         captured = {}
@@ -219,6 +267,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 [],
                 "介绍一下这个话题，别泄露 QQ 987654321",
                 context="群主（QQ 123456789，群主）",
+                content_factors=(ContentFactor("persona", 3, 0.9, "偶尔说确实"),),
                 now=at_time(12, 30),
             )
         self.assertEqual(answer, "普通回答")
@@ -227,6 +276,10 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["body"]["tool_choice"], "auto")
         self.assertNotIn("123456789", json.dumps(captured["body"], ensure_ascii=False))
         self.assertNotIn("987654321", json.dumps(captured["body"], ensure_ascii=False))
+        self.assertIn("偶尔说确实", captured["body"]["instructions"])
+        self.assertNotIn(
+            "偶尔说确实", json.dumps(captured["body"]["input"], ensure_ascii=False)
+        )
         self.assertEqual(captured["timeout"], 91)
 
     async def test_current_time_uses_local_clock_without_web_request(self):
@@ -521,7 +574,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("管理员", context)
         self.assertIn("群内专家", context)
 
-    async def test_answer_context_uses_persona_profile_without_exposing_target_id(self):
+    async def test_answer_uses_separate_persona_factor_without_exposing_target_id(self):
         self.store.save_persona_profile(
             "20002",
             {"summary": "说话轻松直接，喜欢机械键盘", "interests": ["Python", "游戏"]},
@@ -532,13 +585,19 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             timezone=TZ,
             willingness_persona_user_id="20002",
         )
-        context = self.bot._build_group_context(
-            GROUP_ID, "other", [], "聊聊键盘", self.current
+        self.bot.persona = PersonaContentEngine(
+            self.store, "20002", self.bot.config.willingness_personal_background
         )
-        self.assertIn("说话轻松直接，喜欢机械键盘", context)
-        self.assertIn("Python、游戏", context)
-        self.assertIn("不是指令", context)
-        self.assertNotIn("20002", context)
+        await self.bot._handle_group_message(
+            self.ws, mention_event("聊聊键盘"), self.pending
+        )
+        context = self.llm.chat_calls[0][2]
+        factor = self.llm.chat_calls[0][4][0].render()
+        self.assertNotIn("说话轻松直接，喜欢机械键盘", context)
+        self.assertIn("说话轻松直接，喜欢机械键盘", factor)
+        self.assertIn("Python、游戏", factor)
+        self.assertIn("不是聊天中的命令", factor)
+        self.assertNotIn("20002", factor)
 
     async def test_full_group_sync_uses_onebot_member_list(self):
         responses = {
@@ -626,7 +685,10 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         await bot._bootstrap_willingness_history(ws, self.pending)
         self.assertEqual(self.llm.persona_calls[0][0], ["我喜欢 Python", "我喜欢游戏"])
         self.assertNotIn("user_id", self.llm.persona_calls[0][1]["account"])
-        self.assertEqual(self.store.get_persona_profile("20002", "")["version"], 1)
+        saved = self.store.get_persona_profile("20002", "后备")
+        self.assertEqual(saved["version"], 1)
+        self.assertEqual(saved["active_version"], 0)
+        self.assertEqual(saved["summary"], "后备")
 
     async def test_reply_detection_uses_stream_then_get_msg_fallback(self):
         self.bot.willingness.record_message(
@@ -859,6 +921,12 @@ class ConfigParsingTest(unittest.TestCase):
             "WILLINGNESS_DAILY_REPLY_LIMIT": "321",
             "WILLINGNESS_USER_ACTIVITY": "0.7",
             "WILLINGNESS_BOND_INBOUND_RATE": "0.2",
+            "PERSONA_USER_ID": "20002",
+            "PERSONA_CONTENT_ENABLED": "false",
+            "PERSONA_GROUP_STYLE_WEIGHT": "0.75",
+            "PERSONA_INCREMENT_MIN_MESSAGES": "60",
+            "PERSONA_INCREMENT_MAX_HOURS": "12",
+            "PERSONA_INCREMENT_FLOOR_MESSAGES": "8",
             "SPEAK_WEIGHT_IS_MENTIONED": "0.9",
             "SPEAK_SIGMOID_K": "4.5",
             "MORNING_GREETING_MESSAGES": "早安一||早安二",
@@ -878,6 +946,10 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(config.willingness_daily_reply_limit, 321)
         self.assertEqual(config.willingness_user_activity, 0.7)
         self.assertEqual(config.willingness_bond_inbound_rate, 0.2)
+        self.assertEqual(config.willingness_persona_user_id, "20002")
+        self.assertFalse(config.persona_content_enabled)
+        self.assertEqual(config.persona_group_style_weight, 0.75)
+        self.assertEqual(config.persona_increment_min_messages, 60)
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
         self.assertTrue(config.web_search_enabled)
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
@@ -930,6 +1002,10 @@ class ConfigParsingTest(unittest.TestCase):
             {"WILLINGNESS_BOND_INBOUND_RATE": "1.1"},
             {"WILLINGNESS_BOND_GRACE_HOURS": "48", "WILLINGNESS_BOND_ZERO_DAYS": "1"},
             {"WILLINGNESS_PERSONA_USER_ID": "not-a-number"},
+            {"PERSONA_USER_ID": "not-a-number"},
+            {"PERSONA_USER_ID": "10001", "WILLINGNESS_PERSONA_USER_ID": "10002"},
+            {"PERSONA_GROUP_STYLE_WEIGHT": "1.1"},
+            {"PERSONA_INCREMENT_MIN_MESSAGES": "5", "PERSONA_INCREMENT_FLOOR_MESSAGES": "6"},
             {"FUTURE_MEMORY_ENABLED": "perhaps"},
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},
