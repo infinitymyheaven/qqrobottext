@@ -46,25 +46,27 @@ FUTURE_MEMORY_SOURCE=active_window_all
 
 | 模式 | 覆盖范围 | API 成本和隐私影响 |
 | --- | --- | --- |
-| `active_window_all` | 10:00–19:00 的全部白名单群文字消息 | 较高；日期关键词命中的消息会额外调用 DeepSeek |
+| `active_window_all` | 配置的工作时段内全部白名单群文字消息 | 较高；日期关键词命中的消息会额外调用 DeepSeek |
 | `participated` | 被 @ 或算法选中、机器人实际回复的消息 | 较低；可能漏掉机器人未参与的话题 |
 
 程序先使用本地日期关键词过滤，只有疑似包含日期或时间的消息才调用 DeepSeek 提取，因此不会无条件分析每条消息。
 
 ## 作息与主动回复算法
 
-- 回答时段：`[10:00, 19:00)`，默认时区 `Asia/Shanghai`。
-- 10:00 发送一次随机早安消息；19:00 发送一次随机晚安消息。
+- 回答时段默认 `[10:00, 19:00)`，支持 `HH:MM` 分钟级配置，默认时区 `Asia/Shanghai`。
+- 工作开始后发送一次随机早安消息；工作结束后的 10 分钟内发送一次随机晚安消息。两者都可关闭或自定义模板。
 - 回答时段内被 @ 必定回答；回答时段外即使被 @ 也保持沉默。
-- 普通消息至少距离机器人上次发言 600 秒，且当天未达到 50 条上限，才计算：
+- 每个群每天从 `60–100` 中随机选取一个主动回复上限并持久化；普通消息还需满足最小发言间隔才计算得分：
 
 ```text
 得分 = 0.40 × 随机数
-     + 0.25 × min(过去60秒消息数 / 10, 1)
+     + 0.25 × min(流量窗口内消息数 / 10, 1)
      + 0.35 × min(距机器人上次发言秒数 / 1200, 1)
 ```
 
-得分达到 `0.65` 才主动回复。任何机器人消息，包括 @ 回复、问候和提醒，都会重新计算沉默时间。
+上面的权重、流量窗口、满分基准、沉默基准、阈值和间隔都可在 `.env` 调整。任何机器人消息，包括 @ 回复、问候和提醒，都会重新计算沉默时间；只有算法主动回复计入每日上限。
+
+当天随机上限保存在 SQLite，重启不会改变。如果修改配置后旧上限不在新区间内，程序会为当天重新抽取。
 
 ## 永久资料与提醒
 
@@ -73,8 +75,9 @@ FUTURE_MEMORY_SOURCE=active_window_all
 - 启动、重连和每 6 小时通过 NapCat 全量同步群成员。
 - 成员加入、退出、管理员或群名片变化后自动刷新对应群。
 - 当前资料与变更历史均保留；退群成员标记为非活跃而不删除。
-- AI 每次只读取当前发言者、群主/管理员、被 @ 或问题中明确提到的成员，避免把大群名册塞进每次请求。
-- 未来事项提前 60 分钟发送普通文本提醒；若时间落在睡眠时段，会提前移动到最近的工作时段。
+- AI 每次只读取当前发言者、群主/管理员、被 @ 或问题中明确提到的成员，匹配数量可配置，避免把大群名册塞进每次请求。
+- 最近群聊默认保留 5 分钟、最多 20 条、每条最多 300 字；逐成员对话默认保留 10 条，闲置 30 分钟后清空。
+- 未来事项默认提前 60 分钟发送普通文本提醒；若时间落在睡眠时段，会提前移动到最近的工作时段。
 - 提醒后，只要事项来源群友在同群发过任意消息，就视为已确认。
 - 未确认时会随机等待 2–5 小时准备二次 @；事项已经过期则取消二次提醒。
 
@@ -126,17 +129,38 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 根地址或完整聊天接口 |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 模型名称 |
 | `DEEPSEEK_SYSTEM_PROMPT` | 中文群聊助手提示词 | 机器人角色设定 |
+| `DEEPSEEK_TIMEOUT_SECONDS` | `60` | 单次 DeepSeek 请求超时 |
+| `DEEPSEEK_MAX_TOKENS` | `1024` | 聊天回复最大生成 token 数 |
 | `BOT_TIMEZONE` | `Asia/Shanghai` | 作息和提醒时区 |
-| `ANSWER_START_HOUR` / `ANSWER_END_HOUR` | `10` / `19` | 回答时间小时边界 |
-| `SPONTANEOUS_DAILY_LIMIT` | `50` | 每个群每日主动回复上限 |
+| `ANSWER_START_TIME` / `ANSWER_END_TIME` | `10:00` / `19:00` | 分钟级工作时段；结束时间必须更晚，`24:00` 仅可用于结束 |
+| `SPONTANEOUS_REPLIES_ENABLED` | `true` | 是否允许算法主动插话 |
+| `SPONTANEOUS_DAILY_MIN` / `SPONTANEOUS_DAILY_MAX` | `60` / `100` | 每群每天随机主动回复上限区间 |
 | `SPONTANEOUS_MIN_INTERVAL_SECONDS` | `600` | 主动回复最小间隔 |
 | `SPONTANEOUS_SCORE_THRESHOLD` | `0.65` | 主动回复分数阈值 |
+| `SPONTANEOUS_RANDOM_WEIGHT` / `SPONTANEOUS_TRAFFIC_WEIGHT` / `SPONTANEOUS_SILENCE_WEIGHT` | `0.40` / `0.25` / `0.35` | 评分权重，非负且总和必须为 1 |
+| `SPONTANEOUS_TRAFFIC_WINDOW_SECONDS` | `60` | 流量评分统计窗口 |
+| `SPONTANEOUS_TRAFFIC_FULL_SCORE_MESSAGES` | `10` | 流量项达到满分所需消息数 |
+| `SPONTANEOUS_SILENCE_FULL_SCORE_SECONDS` | `1200` | 沉默项达到满分所需秒数 |
 | `MEMBER_SYNC_INTERVAL_SECONDS` | `21600` | 全量成员同步间隔 |
+| `MEMBER_CONTEXT_MATCH_LIMIT` | `20` | 单次回答按名称等检索的成员上限 |
+| `FUTURE_MEMORY_ENABLED` | `true` | 是否提取、注入和提醒未来事项 |
 | `FUTURE_MEMORY_SOURCE` | `active_window_all` | 日期记忆来源模式 |
+| `FUTURE_EXTRACTION_CONCURRENCY` | `2` | 日期候选消息调用 DeepSeek 的最大并发数 |
+| `FUTURE_CONTEXT_MAX_EVENTS` | `20` | 单次回答注入的有效未来事项上限 |
 | `REMINDER_LEAD_MINUTES` | `60` | 初次提醒提前分钟数 |
+| `REMINDER_FOLLOWUP_MIN_MINUTES` / `REMINDER_FOLLOWUP_MAX_MINUTES` | `120` / `300` | 二次提醒随机等待区间 |
 | `MEMORY_DB_PATH` | `data/bot_memory.sqlite3` | 本地数据库路径 |
-| `CHAT_HISTORY_MESSAGES` | `10` | 每位成员的有限对话上下文 |
+| `GROUP_CONTEXT_WINDOW_SECONDS` | `300` | 最近群聊上下文时间窗口 |
+| `GROUP_CONTEXT_MAX_MESSAGES` | `20` | 最近群聊注入条数上限，`0` 禁用 |
+| `GROUP_CONTEXT_MESSAGE_MAX_CHARS` | `300` | 每条临时群消息保存字符数 |
+| `CHAT_HISTORY_MESSAGES` | `10` | 每位成员对话历史条数，`0` 禁用 |
+| `CHAT_HISTORY_TTL_MINUTES` | `30` | 对话历史闲置过期时间，`0` 表示永不过期到进程结束 |
 | `MAX_REPLY_CHARS` | `2000` | QQ 单次回复最大字符数 |
+| `MORNING_GREETING_ENABLED` / `NIGHT_GREETING_ENABLED` | `true` / `true` | 是否发送上下班问候 |
+| `MORNING_GREETING_MESSAGES` / `NIGHT_GREETING_MESSAGES` | 内置三条模板 | 使用 `||` 分隔多条随机模板 |
+| `EMPTY_MENTION_REPLY` / `AI_ERROR_REPLY` | 内置中文提示 | 空 @ 和 AI 故障时的回复文本 |
+
+布尔值可写 `true/false`、`1/0`、`yes/no` 或 `on/off`。配置使用严格校验：格式错误、范围倒置、无效时区或权重之和不为 1 时，程序会在连接 NapCat 前退出并指出变量名。`FUTURE_MEMORY_ENABLED=false` 会同时停止新事项提取、事项上下文注入和主动提醒。旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR` 和 `SPONTANEOUS_DAILY_LIMIT` 已废弃。
 
 ## 启动与测试
 

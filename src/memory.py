@@ -87,6 +87,7 @@ class MemoryStore:
                 group_id TEXT NOT NULL,
                 local_date TEXT NOT NULL,
                 spontaneous_count INTEGER NOT NULL DEFAULT 0,
+                daily_spontaneous_limit INTEGER,
                 morning_sent INTEGER NOT NULL DEFAULT 0,
                 night_sent INTEGER NOT NULL DEFAULT 0,
                 last_bot_sent_at REAL,
@@ -94,6 +95,13 @@ class MemoryStore:
             );
             """
         )
+        activity_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(bot_activity)")
+        }
+        if "daily_spontaneous_limit" not in activity_columns:
+            self.conn.execute(
+                "ALTER TABLE bot_activity ADD COLUMN daily_spontaneous_limit INTEGER"
+            )
         self.conn.commit()
 
     @staticmethod
@@ -360,10 +368,36 @@ class MemoryStore:
             "group_id": str(group_id),
             "local_date": local_date,
             "spontaneous_count": 0,
+            "daily_spontaneous_limit": None,
             "morning_sent": 0,
             "night_sent": 0,
             "last_bot_sent_at": None,
         }
+
+    def ensure_daily_spontaneous_limit(
+        self,
+        group_id: str | int,
+        local_date: str,
+        minimum: int,
+        maximum: int,
+        candidate: int,
+    ) -> int:
+        """返回当天持久化上限；配置区间改变且旧值越界时更新。"""
+        current = self.get_activity(group_id, local_date)["daily_spontaneous_limit"]
+        if current is not None and minimum <= int(current) <= maximum:
+            return int(current)
+        chosen = min(maximum, max(minimum, int(candidate)))
+        self.conn.execute(
+            """
+            INSERT INTO bot_activity(group_id, local_date, daily_spontaneous_limit)
+            VALUES (?, ?, ?)
+            ON CONFLICT(group_id, local_date) DO UPDATE SET
+                daily_spontaneous_limit=excluded.daily_spontaneous_limit
+            """,
+            (str(group_id), local_date, chosen),
+        )
+        self.conn.commit()
+        return chosen
 
     def record_bot_message(
         self,

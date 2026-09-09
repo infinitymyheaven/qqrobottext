@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from src.bot import (
     BotConfig,
+    ConfigError,
     DeepSeekClient,
     OneBotActionError,
     QQBot,
@@ -87,15 +89,19 @@ class FakeLLM:
 
 
 class FixedRNG:
-    def __init__(self, value=1.0, uniform_value=3.0):
+    def __init__(self, value=1.0, uniform_value=180.0, randint_value=None):
         self.value = value
         self.uniform_value = uniform_value
+        self.randint_value = randint_value
 
     def random(self):
         return self.value
 
     def uniform(self, _start, _end):
         return self.uniform_value
+
+    def randint(self, start, end):
+        return start if self.randint_value is None else min(end, max(start, self.randint_value))
 
     def choice(self, values):
         return values[0]
@@ -195,6 +201,18 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_group_message(self.ws, mention_event("还在吗"), self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
 
+    def test_minute_answer_time_boundaries(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            answer_start_minutes=630,
+            answer_end_minutes=1155,
+        )
+        self.assertFalse(self.bot.is_answer_time(at_time(10, 29)))
+        self.assertTrue(self.bot.is_answer_time(at_time(10, 30)))
+        self.assertTrue(self.bot.is_answer_time(at_time(19, 14)))
+        self.assertFalse(self.bot.is_answer_time(at_time(19, 15)))
+
     async def test_spontaneous_score_interval_and_daily_limit(self):
         event = group_event([{"type": "text", "data": {"text": "普通话题"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
@@ -205,7 +223,10 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.llm.chat_calls), 1)
 
         limited_config = BotConfig(
-            active_group_ids=frozenset({GROUP_ID}), timezone=TZ, spontaneous_daily_limit=1
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            spontaneous_daily_min=1,
+            spontaneous_daily_max=1,
         )
         limited = QQBot(
             "ws://test",
@@ -311,12 +332,105 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         await self.bot._run_scheduled_once(self.ws, self.pending)
         self.assertEqual(len(self.ws.sent), 2)
 
+    async def test_custom_greeting_and_switch(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            morning_messages=("自定义早安",),
+            night_greeting_enabled=False,
+        )
+        await self.bot._run_scheduled_once(self.ws, self.pending)
+        self.assertEqual(self.ws.sent[-1]["params"]["message"], "自定义早安")
+        self.current = at_time(19, 1)
+        await self.bot._run_scheduled_once(self.ws, self.pending)
+        self.assertEqual(len(self.ws.sent), 1)
+
+    async def test_custom_empty_and_error_replies(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            empty_reply="请说内容",
+            error_reply="服务开小差了",
+        )
+        empty_mention = group_event([{"type": "at", "data": {"qq": SELF_ID}}])
+        await self.bot._handle_group_message(self.ws, empty_mention, self.pending)
+        self.assertEqual(self.ws.sent[-1]["params"]["message"], "请说内容")
+        self.bot.llm_client = None
+        await self.bot._handle_group_message(self.ws, mention_event("问题"), self.pending)
+        self.assertEqual(self.ws.sent[-1]["params"]["message"], "服务开小差了")
+
+    async def test_history_expires_after_idle_ttl(self):
+        await self.bot._handle_group_message(self.ws, mention_event("第一问"), self.pending)
+        self.current += timedelta(minutes=31)
+        await self.bot._handle_group_message(self.ws, mention_event("第二问"), self.pending)
+        self.assertEqual(self.llm.chat_calls[1][0], [])
+
+    async def test_group_context_uses_time_count_and_character_limits(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            group_context_window_seconds=300,
+            group_context_max_messages=2,
+            group_context_message_max_chars=5,
+        )
+        for index, text in enumerate(("过期消息", "第一条很长", "第二条很长")):
+            when = self.current - timedelta(seconds=301 if index == 0 else 10 - index)
+            self.bot._remember_recent(
+                GROUP_ID, str(index), text, group_event(text, user_id=str(index)), when
+            )
+        context = self.bot._build_group_context(GROUP_ID, "20002", [], "问题", self.current)
+        self.assertNotIn("过期消息", context)
+        self.assertIn("第一条很", context)
+        self.assertIn("第二条很", context)
+
+    async def test_traffic_score_uses_independent_window(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            group_context_window_seconds=300,
+            spontaneous_traffic_window_seconds=60,
+            spontaneous_score_threshold=0.4,
+        )
+        self.bot.rng = FixedRNG(value=0.0)
+        for index in range(10):
+            self.bot._remember_recent(
+                GROUP_ID,
+                str(index),
+                "旧消息",
+                group_event("旧消息", user_id=str(index)),
+                self.current - timedelta(seconds=120),
+            )
+        self.assertFalse(self.bot._should_reply_spontaneously(GROUP_ID, self.current))
+
     async def test_active_window_all_extracts_even_without_reply(self):
         self.bot.rng = FixedRNG(value=0.0)
         event = group_event([{"type": "text", "data": {"text": "明天十点开会"}}])
         await self.bot._handle_group_message(self.ws, event, self.pending)
         self.assertEqual(len(self.llm.chat_calls), 0)
         self.assertEqual(len(self.llm.extract_calls), 1)
+
+    async def test_future_memory_switch_disables_extraction_and_reminders(self):
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            future_memory_enabled=False,
+            morning_greeting_enabled=False,
+        )
+        event = group_event([{"type": "text", "data": {"text": "明天十点开会"}}])
+        await self.bot._handle_group_message(self.ws, event, self.pending)
+        self.assertEqual(self.llm.extract_calls, [])
+        self.store.add_future_event(
+            group_id=GROUP_ID,
+            source_user_id="20002",
+            source_message_id="off",
+            summary="不会提醒",
+            event_at=(self.current + timedelta(hours=1)).timestamp(),
+            remind_at=self.current.timestamp(),
+            created_at=self.current.timestamp(),
+        )
+        sent_before = len(self.ws.sent)
+        await self.bot._run_scheduled_once(self.ws, self.pending)
+        self.assertEqual(len(self.ws.sent), sent_before)
 
     async def test_participated_mode_skips_unanswered_message(self):
         config = BotConfig(
@@ -349,6 +463,11 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         )
         await self.bot._run_scheduled_once(self.ws, self.pending)
         self.assertIn("提醒一下", self.ws.sent[-1]["params"]["message"])
+        saved = self.store.get_active_events(GROUP_ID, self.current.timestamp())[0]
+        self.assertEqual(
+            saved["followup_at"],
+            (self.current + timedelta(minutes=180)).timestamp(),
+        )
 
         self.current += timedelta(minutes=5)
         await self.bot._handle_group_message(
@@ -386,6 +505,56 @@ class EmptyAllowlistTest(unittest.TestCase):
     def test_empty_allowlist_is_supported(self):
         config = BotConfig(active_group_ids=frozenset(), timezone=TZ)
         self.assertEqual(config.active_group_ids, frozenset())
+
+
+class ConfigParsingTest(unittest.TestCase):
+    def test_minute_times_ranges_switches_and_templates(self):
+        values = {
+            "ANSWER_START_TIME": "10:30",
+            "ANSWER_END_TIME": "19:15",
+            "SPONTANEOUS_DAILY_MIN": "60",
+            "SPONTANEOUS_DAILY_MAX": "100",
+            "SPONTANEOUS_REPLIES_ENABLED": "off",
+            "MORNING_GREETING_MESSAGES": "早安一||早安二",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            config = BotConfig.from_env()
+        self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (630, 1155))
+        self.assertFalse(config.spontaneous_replies_enabled)
+        self.assertEqual(config.morning_messages, ("早安一", "早安二"))
+
+    def test_legacy_hour_variables_are_ignored(self):
+        with patch.dict(
+            os.environ,
+            {"ANSWER_START_HOUR": "1", "ANSWER_END_HOUR": "2", "SPONTANEOUS_DAILY_LIMIT": "3"},
+            clear=True,
+        ):
+            config = BotConfig.from_env()
+        self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (600, 1140))
+        self.assertEqual((config.spontaneous_daily_min, config.spontaneous_daily_max), (60, 100))
+
+    def test_all_day_time_range(self):
+        with patch.dict(
+            os.environ,
+            {"ANSWER_START_TIME": "00:00", "ANSWER_END_TIME": "24:00"},
+            clear=True,
+        ):
+            config = BotConfig.from_env()
+        self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (0, 1440))
+
+    def test_invalid_configuration_is_rejected(self):
+        invalid_values = (
+            {"ANSWER_START_TIME": "9:00"},
+            {"ANSWER_END_TIME": "24:01"},
+            {"ANSWER_START_TIME": "20:00", "ANSWER_END_TIME": "19:00"},
+            {"SPONTANEOUS_DAILY_MIN": "101", "SPONTANEOUS_DAILY_MAX": "100"},
+            {"SPONTANEOUS_RANDOM_WEIGHT": "0.5"},
+            {"FUTURE_MEMORY_ENABLED": "perhaps"},
+        )
+        for values in invalid_values:
+            with self.subTest(values=values), patch.dict(os.environ, values, clear=True):
+                with self.assertRaises(ConfigError):
+                    BotConfig.from_env()
 
 
 if __name__ == "__main__":
