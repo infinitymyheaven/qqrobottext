@@ -4,6 +4,9 @@ node_modules/
 # NapCat 本地运行时目录：第三方分发物 + QQ 账号运行数据，不应上传（许可与隐私原因）
 qq/
 
+# 机器人本地持久化记忆（群成员与未来事项，含隐私数据）
+data/
+
 # Python
 __pycache__/
 *.pyc

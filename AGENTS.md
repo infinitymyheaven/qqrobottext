@@ -1,68 +1,77 @@
-# AGENTS.md — QQ 群 DeepSeek 机器人项目速查
+# AGENTS.md — QQ 群智能 DeepSeek 机器人速查
 
-## 1. 项目概述
+## 1. 项目与当前分支
 
-- 项目：`qqrobottext`，Python QQ 群聊机器人。
-- 功能：群聊中被 `@机器人本人` 时，提取文字、调用 DeepSeek Chat Completions API，并把回复发回群聊。
-- 不处理：普通群消息、`@全体成员`、私聊、主动发言、图片和文件输入。
-- 架构：NapCat（OneBot v11 正向 WebSocket）+ 本项目 Python 客户端 + DeepSeek OpenAI 兼容 API。
-- 依赖：仅 `websockets`；HTTP 请求使用 Python 标准库。Python 要求 3.10 以上。
+- 项目：`qqrobottext`，Python QQ 群机器人。
+- 开发分支：`智能ai分支`；基于 `main` 的提交 `1189ac6` 创建，不要自动合并回 `main`。
+- 架构：NapCat OneBot v11 正向 WebSocket + Python 客户端 + DeepSeek Chat Completions + SQLite。
+- 功能：白名单群成员同步、身份/头衔永久记忆、10:00–19:00 作息、智能主动回复、未来事项提醒。
+- 依赖：`websockets`、`tzdata`；其余使用 Python 标准库。Python 3.10+。
 
-## 2. 目录与运行
+## 2. 关键文件与命令
 
-- `src/bot.py`：全部机器人、DeepSeek HTTP 客户端和入口逻辑。
-- `tests/test_bot.py`：消息解析、API 请求格式、上下文隔离和群聊行为测试。
-- `.env.example`：NapCat 与 DeepSeek 配置示例；真实 `.env` 已忽略。
-- `README.md`：完整中文安装与使用文档。
-- 本机运行：`.venv\Scripts\python.exe src\bot.py`
+- `src/bot.py`：配置、DeepSeek 客户端、OneBot 连接、回答策略、同步和提醒调度。
+- `src/memory.py`：SQLite 表结构和所有持久化读写。
+- `tests/test_bot.py` / `tests/test_memory.py`：模拟 API、策略和持久化测试。
+- `.env.example`：全部配置；真实 `.env` 已忽略。
+- 运行：`.venv\Scripts\python.exe src\bot.py`
 - 测试：`.venv\Scripts\python.exe -m unittest discover -s tests -v`
-- Windows 系统 `python` 是商店占位符，本机操作一律使用项目 `.venv` 中的 Python。
-- `.venv` 的基础解释器固定在 `D:\codex\python-runtimes\cpython-3.12.14-windows-x86_64-none\python.exe`，普通 PowerShell 可直接访问。不要改回 Codex 应用隔离的 `AppData\Roaming\uv` 路径。
-- 旧的应用隔离环境临时保留为 `.venv-virtualized-old/` 且已被 Git 忽略；确认无需回退后可删除。
+- 本机 `.venv` 基础解释器：`D:\codex\python-runtimes\cpython-3.12.14-windows-x86_64-none\python.exe`。不要改回 Codex 应用隔离的 `AppData\Roaming\uv` 路径。
 
-## 3. 配置
+## 3. 安全边界与配置
 
-- `NAPCAT_WS_URL`：默认 `ws://127.0.0.1:3001`。
-- `NAPCAT_WS_TOKEN`：默认空，通过 URL 的 `access_token` 参数传递。
-- `DEEPSEEK_API_KEY`：必填，缺失时程序以状态码 2 退出。
-- `DEEPSEEK_BASE_URL`：默认 `https://api.deepseek.com`。
-- `DEEPSEEK_MODEL`：默认 `deepseek-v4-flash`，可为兼容服务商的模型名。
-- `DEEPSEEK_SYSTEM_PROMPT`、`DEEPSEEK_TIMEOUT_SECONDS`、`DEEPSEEK_MAX_TOKENS` 可调。
-- `CHAT_HISTORY_MESSAGES`：默认 10 条，`0` 关闭上下文。
-- `MAX_REPLY_CHARS`：默认 2000 字符。
+- `ACTIVE_GROUP_IDS` 是英文逗号分隔的 QQ 群号白名单；为空时禁用回复、同步、问候和提醒。
+- 白名单不等于已入群：每次连接先用 `get_group_list` 验证实际在群状态，只有交集群会同步和主动发送；群消息/通知也会实时更新已入群集合。
+- 回答窗口默认 `[10:00, 19:00)`，时区 `Asia/Shanghai`；窗口外被 @ 也不回答。
+- `FUTURE_MEMORY_SOURCE=active_window_all` 默认扫描回答时段内日期候选消息；改为 `participated` 只分析机器人参与的消息。两套逻辑在 `_handle_group_message()` 有注释，README 必须保持显著说明。
+- `DEEPSEEK_API_KEY` 必填。任何真实 API Key、NapCat WebUI Token、群号白名单、数据库内容或 QQ 登录数据都不得写入文档或提交。
+- `.env`、`data/`、`qq/`、`.venv/` 和 `.venv-virtualized-old/` 均应保持忽略。
 
-任何真实 API Key、NapCat WebUI Token 或 QQ 登录数据都不得写入文档或提交。
+## 4. 成员资料与上下文
 
-## 4. 实现要点
+- 连接后调用 `get_group_list` 和每个白名单群的 `get_group_member_list(no_cache=true)`；每 21600 秒重做全量同步。
+- 定时问候或提醒遇到 OneBot 动作失败时只暂停对应群，不允许异常结束调度器并触发 WebSocket 重连循环。
+- `group_increase`、`group_decrease`、`group_admin`、`group_card` 通知会延迟 2 秒刷新该群并合并重复刷新。
+- SQLite 默认 `data/bot_memory.sqlite3`：
+  - `groups`：群名与最后同步时间。
+  - `members`：当前昵称、群名片、`role`、专属头衔、首次/最后发现、是否仍在群。
+  - `member_history`：仅在资料或活跃状态变化时追加快照，永不因上下文截断删除。
+  - `future_events`：未来事项、提醒、确认和二次提醒状态。
+  - `bot_activity`：每群每日主动回复数、早晚问候和最后发言时间。
+- AI 上下文始终包含发言者、当前群主/管理员、被 @ 的其他成员、问题中按 QQ/昵称/群名片/头衔命中的成员，以及最多 20 条有效未来事项和最近一分钟最多 20 条消息。
+- 普通对话历史仍以 `(group_id, user_id)` 隔离并受 `CHAT_HISTORY_MESSAGES` 限制；永久结构化资料不在该限制内。
 
-- `DeepSeekClient.chat()` 通过 `asyncio.to_thread` 执行标准库 HTTP 请求，避免阻塞 WebSocket 事件循环。
-- 接口使用 Bearer Token，向 `{base_url}/chat/completions` 发送 OpenAI 兼容消息；若 Base URL 已包含完整路径则不重复拼接。
-- `extract_message_text()` 只提取 OneBot 文本段；字符串格式会移除 CQ 码并反转义 HTML 实体。
-- `QQBot._handle_group_message()` 仅接受群聊中对 `self_id` 的 @，忽略自身消息。
-- 对话上下文以 `(group_id, user_id)` 为键隔离，每个会话用异步锁保持连续对话顺序。
-- API 失败时回复固定友好提示，失败请求不会写入历史；回复过长会截断。
-- `QQBot.run()` 断开或异常后每 3 秒自动连接 NapCat。
-- `_read_loop()` 按 `echo` 匹配 OneBot 动作响应，群事件使用独立任务处理。
+## 5. 主动回复与作息算法
 
-## 5. 本机环境事实
+- 回答时段内 @ 必答且不占主动额度；普通文字消息才参与随机判断。
+- 每群每天最多 50 条主动回复，最小间隔 600 秒。
+- 评分：`0.40*随机数 + 0.25*min(近60秒消息数/10,1) + 0.35*min(沉默秒数/1200,1)`；默认阈值 `0.65`。
+- 所有成功发出的机器人消息都会更新 `last_bot_sent_at`；只有算法触发回复增加 `spontaneous_count`。
+- 10:00 后调度器发送一次随机早安；19:00–19:09 发送一次随机晚安。持久化标志防止重连重复发送。
+- 后台同步或调度任务异常会结束当前连接会话，由外层 3 秒重连恢复，避免功能静默失效。
 
-- QQ：`D:\Program Files\Tencent\QQNT\QQ.exe`，版本 `9.9.19.35184`。
-- NapCat：本地目录 `qq/` 已被 Git 忽略；官方启动器无法探测 QQ，需管理员运行 `qq/napcat/launcher-fixed.bat`。
-- OneBot 配置：`127.0.0.1:3001`、数组消息格式、Token 空、心跳 30 秒。
-- 2026-09-09 重新验证时 NapCat 已能在 `127.0.0.1:3001` 接受连接；真实端到端测试时仍需保持其控制台进程运行。
+## 6. 未来事项规则
+
+- 本地 `_DATE_CUE_PATTERN` 先过滤，DeepSeek 再输出 JSON：`events[{summary,event_at}]`。
+- 相对日期按当前 `BOT_TIMEZONE` 解析；仅日期默认 23:59；过去或格式无效的事项丢弃；相同群、来源、摘要和时间去重。
+- 初次提醒默认提前 60 分钟且不 @；睡眠时段的提醒提前移动到最近的回答时段。
+- 初次提醒后，来源成员在同群发任意消息即写入确认状态。
+- 未确认时随机 2–5 小时后准备二次 @；若事项届时已过期，SQL 查询会自动排除，不发送。
+- 提醒状态持久化，重启后不会重复发送。
+
+## 7. 本机与版本控制事实
+
+- QQ：`D:\Program Files\Tencent\QQNT\QQ.exe`；NapCat 使用 `qq/napcat/launcher-fixed.bat`。
+- OneBot：`127.0.0.1:3001`、数组消息格式、Token 默认空。NapCat 控制台必须保持运行。
+- 2026-09-09 09:05 的最后一次启动检查中端口 3001 拒绝连接，说明当时 NapCat 未运行；端到端验收前需重新启动。
 - `qq/napcat/config/webui.json` 含敏感 Token，不得读取后输出或提交。
-- GitHub 远端：`https://github.com/infinitymyheaven/qqrobottext`，公开仓库，分支 `main`。
-- GitHub 网络使用仓库既有代理配置。
+- 远端：`https://github.com/infinitymyheaven/qqrobottext`。GitHub 网络使用仓库既有代理配置。
+- 实现完成后先运行全部测试、语法检查、`git diff --check` 和疑似密钥扫描，再提交并仅推送 `智能ai分支`。
 
-## 6. 当前进度与待办
+## 8. 验收重点
 
-- 已完成：Node.js 到 Python 重构；DeepSeek API 聊天接入；按群成员隔离的有限上下文；8 项模拟 API/行为测试；配置与 README；本地 `.env` 已由用户填写且保持忽略状态；新 `.venv` 已成功启动并连接 NapCat。
-- 待办：在真实 QQ 群完成端到端聊天验收。
-- 端到端检查：@机器人能回答；连续追问能读取上下文；普通消息、@全体、私聊和自身消息不回复；错误密钥能返回友好提示。
-
-## 7. 安全与版本控制
-
-- `.env`、`qq/`、`.venv/` 均已忽略；提交前仍需检查密钥未进入 diff。
-- 使用普通 QQ 登录存在风控和封号风险，建议小号。
-- DeepSeek API 会产生用量和费用，测试时注意账户余额与请求频率。
-- 新改动验证后再按用户明确要求提交和推送，不自动扩大远端写入范围。
+- 白名单为空完全静默；非白名单群不读资料、不回复。
+- 名册无需群友发言即可识别群主、管理员、群名片和专属头衔；重启后资料仍在。
+- 10:00/19:00 边界、@必答、普通消息权重、十分钟间隔和每日上限正确。
+- 两种日期来源模式、提醒时段调整、任意消息确认、过期取消二次 @ 正确。
+- 测试不得调用真实 DeepSeek 或向真实 QQ 群发消息。
