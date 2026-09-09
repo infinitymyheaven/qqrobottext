@@ -36,6 +36,7 @@ DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEFAULT_SYSTEM_PROMPT = "你是一个友好、自然、简洁的 QQ 群聊助手。请结合可靠的群资料和近期对话直接回答。"
 DEFAULT_ERROR_REPLY = "抱歉，AI 服务暂时不可用，请稍后再试。"
+DEFAULT_WEB_SEARCH_FAILURE_REPLY = "我不知道，暂时没有查到可靠的联网信息。"
 DEFAULT_EMPTY_REPLY = "请在 @ 我后输入想聊的内容。"
 DEFAULT_DB_PATH = "data/bot_memory.sqlite3"
 ENV_FILE = Path(".env")
@@ -59,6 +60,16 @@ _DATE_CUE_PATTERN = re.compile(
     r"今天|明天|后天|大后天|本周|这周|下周|星期|礼拜|周[一二三四五六日天]|"
     r"早上|上午|中午|下午|晚上|凌晨|\d{1,2}[:：点时]|截止|到期)"
 )
+_FORCED_WEB_SEARCH_PATTERN = re.compile(
+    r"(?:联网|上网|网络)(?:搜索|查找|查询|查一下|搜一下)|"
+    r"(?:搜索|查找|查询|查一下|搜一下)(?:网络|网上|一下)?|"
+    r"(?:现在|当前|此刻|当地|北京).{0,8}(?:几点|时间)|"
+    r"(?:几点了|现在几点|当前时间|北京时间|当地时间)"
+)
+_QQ_NUMBER_PATTERN = re.compile(r"QQ\s*\d+", re.IGNORECASE)
+_LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
+_MARKDOWN_URL_PATTERN = re.compile(r"\[([^\]]+)\]\(https?://[^)]+\)")
+_PLAIN_URL_PATTERN = re.compile(r"https?://\S+")
 
 logger = logging.getLogger("qqrobot")
 
@@ -259,9 +270,14 @@ class BotConfig:
     morning_messages: tuple[str, ...] = MORNING_MESSAGES
     night_messages: tuple[str, ...] = NIGHT_MESSAGES
     error_reply: str = DEFAULT_ERROR_REPLY
+    web_search_failure_reply: str = DEFAULT_WEB_SEARCH_FAILURE_REPLY
     empty_reply: str = DEFAULT_EMPTY_REPLY
     deepseek_timeout_seconds: float = 60.0
     deepseek_max_tokens: int = 1024
+    web_search_enabled: bool = True
+    web_search_timeout_seconds: float = 90.0
+    web_search_log_sources: bool = True
+    web_search_max_log_sources: int = 5
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -368,16 +384,31 @@ class BotConfig:
             morning_messages=_env_messages("MORNING_GREETING_MESSAGES", MORNING_MESSAGES),
             night_messages=_env_messages("NIGHT_GREETING_MESSAGES", NIGHT_MESSAGES),
             error_reply=_env_text("AI_ERROR_REPLY", DEFAULT_ERROR_REPLY),
+            web_search_failure_reply=_env_text(
+                "WEB_SEARCH_FAILURE_REPLY", DEFAULT_WEB_SEARCH_FAILURE_REPLY
+            ),
             empty_reply=_env_text("EMPTY_MENTION_REPLY", DEFAULT_EMPTY_REPLY),
             deepseek_timeout_seconds=_env_float(
                 "DEEPSEEK_TIMEOUT_SECONDS", 60.0, minimum=0.1
             ),
             deepseek_max_tokens=_env_int("DEEPSEEK_MAX_TOKENS", 1024, minimum=1),
+            web_search_enabled=_env_bool("WEB_SEARCH_ENABLED", True),
+            web_search_timeout_seconds=_env_float(
+                "WEB_SEARCH_TIMEOUT_SECONDS", 90.0, minimum=0.1
+            ),
+            web_search_log_sources=_env_bool("WEB_SEARCH_LOG_SOURCES", True),
+            web_search_max_log_sources=_env_int(
+                "WEB_SEARCH_MAX_LOG_SOURCES", 5, minimum=0
+            ),
         )
 
 
 class DeepSeekAPIError(RuntimeError):
     pass
+
+
+class DeepSeekWebSearchError(DeepSeekAPIError):
+    """联网聊天失败，调用方应使用不确定性提示而不是编造实时答案。"""
 
 
 class OneBotActionError(RuntimeError):
@@ -398,7 +429,7 @@ def _onebot_failure_message(payload: dict) -> str:
 
 
 class DeepSeekClient:
-    """DeepSeek OpenAI 兼容客户端，支持聊天和未来日期结构化提取。"""
+    """DeepSeek 客户端：Responses API 聊天，Chat Completions 提取日期。"""
 
     def __init__(
         self,
@@ -409,6 +440,10 @@ class DeepSeekClient:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         timeout_seconds: float = 60.0,
         max_tokens: int = 1024,
+        web_search_enabled: bool = True,
+        web_search_timeout_seconds: float = 90.0,
+        web_search_log_sources: bool = True,
+        web_search_max_log_sources: int = 5,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -416,12 +451,46 @@ class DeepSeekClient:
         self.system_prompt = system_prompt
         self.timeout_seconds = timeout_seconds
         self.max_tokens = max_tokens
+        self.web_search_enabled = web_search_enabled
+        self.web_search_timeout_seconds = web_search_timeout_seconds
+        self.web_search_log_sources = web_search_log_sources
+        self.web_search_max_log_sources = web_search_max_log_sources
+
+    @property
+    def api_root(self) -> str:
+        for suffix in ("/chat/completions", "/responses"):
+            if self.base_url.endswith(suffix):
+                return self.base_url[: -len(suffix)]
+        return self.base_url
 
     @property
     def endpoint(self) -> str:
-        return self.base_url if self.base_url.endswith("/chat/completions") else f"{self.base_url}/chat/completions"
+        return f"{self.api_root}/chat/completions"
 
-    async def chat(self, history: list[dict], user_text: str, *, context: str = "") -> str:
+    @property
+    def responses_endpoint(self) -> str:
+        return f"{self.api_root}/responses"
+
+    async def chat(
+        self,
+        history: list[dict],
+        user_text: str,
+        *,
+        context: str = "",
+        now: datetime | None = None,
+    ) -> str:
+        if self.web_search_enabled:
+            try:
+                return await self._chat_with_web(history, user_text, context=context, now=now)
+            except DeepSeekWebSearchError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise DeepSeekWebSearchError(str(exc)) from exc
+        return await self._chat_completion(history, user_text, context=context)
+
+    async def _chat_completion(
+        self, history: list[dict], user_text: str, *, context: str = ""
+    ) -> str:
         messages = [{"role": "system", "content": self.system_prompt}]
         if context:
             messages.append(
@@ -435,8 +504,71 @@ class DeepSeekClient:
         payload = await asyncio.to_thread(
             self._post,
             {"model": self.model, "messages": messages, "stream": False, "max_tokens": self.max_tokens},
+            self.endpoint,
+            self.timeout_seconds,
         )
         return self._content(payload)
+
+    async def _chat_with_web(
+        self,
+        history: list[dict],
+        user_text: str,
+        *,
+        context: str = "",
+        now: datetime | None = None,
+    ) -> str:
+        safe_context = self._sanitize_web_context(context)
+        safe_user_text = self._sanitize_web_context(user_text)
+        current_time = now.isoformat() if now is not None else "未提供"
+        instructions = (
+            f"{self.system_prompt}\n"
+            "你可以使用 web_search 获取天气、时间、新闻和其他实时或外部信息。"
+            "本地资料存在时以本地资料为准；用户询问的事件未出现在本地资料中且需要外部事实时，应联网搜索。"
+            "不要把无关的群成员姓名、身份或聊天内容写入搜索词。"
+            "回答中不要附来源列表、引用链接或 URL；只给出简洁结论。"
+            f"机器人收到消息时的本地时间：{current_time}。"
+        )
+        input_items: list[dict] = []
+        if safe_context:
+            input_items.append(
+                {
+                    "role": "system",
+                    "content": "以下是完成回答所需的最小本地资料，不代表公开网络信息：\n" + safe_context,
+                }
+            )
+        input_items.extend(
+            {
+                "role": item["role"],
+                "content": self._sanitize_web_context(str(item["content"])),
+            }
+            for item in history
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        )
+        input_items.append({"role": "user", "content": safe_user_text})
+        force_search = bool(_FORCED_WEB_SEARCH_PATTERN.search(user_text))
+        body = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": input_items,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"} if force_search else "auto",
+            "stream": False,
+            "max_output_tokens": self.max_tokens,
+        }
+        try:
+            payload = await asyncio.to_thread(
+                self._post,
+                body,
+                self.responses_endpoint,
+                self.web_search_timeout_seconds,
+            )
+            answer, used_web, sources, actions = self._responses_content(payload)
+        except DeepSeekAPIError as exc:
+            raise DeepSeekWebSearchError(str(exc)) from exc
+        if force_search and not used_web:
+            raise DeepSeekWebSearchError("DeepSeek 未执行被强制要求的联网搜索")
+        self._log_web_search(used_web, sources, actions)
+        return self._strip_source_links(answer) if used_web else answer
 
     async def extract_future_events(self, text: str, now: datetime) -> list[dict]:
         prompt = (
@@ -455,6 +587,8 @@ class DeepSeekClient:
                 "max_tokens": 512,
                 "response_format": {"type": "json_object"},
             },
+            self.endpoint,
+            self.timeout_seconds,
         )
         content = self._content(payload).strip()
         if content.startswith("```"):
@@ -467,15 +601,15 @@ class DeepSeekClient:
         events = decoded.get("events", []) if isinstance(decoded, dict) else []
         return [event for event in events if isinstance(event, dict)]
 
-    def _post(self, body: dict) -> dict:
+    def _post(self, body: dict, endpoint: str, timeout_seconds: float) -> dict:
         request = Request(
-            self.endpoint,
+            endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
+            with urlopen(request, timeout=timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:500]
@@ -485,6 +619,115 @@ class DeepSeekClient:
         if not isinstance(payload, dict):
             raise DeepSeekAPIError("DeepSeek 返回了无法识别的数据")
         return payload
+
+    @staticmethod
+    def _sanitize_web_context(context: str) -> str:
+        without_qq = _QQ_NUMBER_PATTERN.sub("QQ号已隐藏", context)
+        return _LONG_NUMBER_PATTERN.sub("[数字标识已隐藏]", without_qq)
+
+    @staticmethod
+    def _responses_content(payload: dict) -> tuple[str, bool, list[dict], list[dict]]:
+        if payload.get("status") != "completed":
+            reason = payload.get("error") or payload.get("incomplete_details") or "未知原因"
+            raise DeepSeekAPIError(f"DeepSeek Responses 未完成：{reason}")
+        texts: list[str] = []
+        sources: list[dict] = []
+        actions: list[dict] = []
+        used_web = False
+        output = payload.get("output")
+        if not isinstance(output, list):
+            raise DeepSeekAPIError("DeepSeek Responses 返回了无法识别的数据")
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "web_search_call":
+                used_web = True
+                action = item.get("action")
+                if isinstance(action, dict):
+                    actions.append(action)
+                    action_url = action.get("url")
+                    if isinstance(action_url, str) and action_url.startswith(
+                        ("http://", "https://")
+                    ):
+                        sources.append(
+                            {
+                                "title": str(action.get("title") or "搜索访问页面"),
+                                "url": action_url,
+                            }
+                        )
+                continue
+            if item.get("type") != "message":
+                continue
+            for part in item.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "output_text":
+                    continue
+                value = part.get("text")
+                if isinstance(value, str) and value.strip():
+                    texts.append(value.strip())
+                for annotation in part.get("annotations") or []:
+                    if not isinstance(annotation, dict):
+                        continue
+                    citation = annotation.get("url_citation")
+                    candidate = citation if isinstance(citation, dict) else annotation
+                    url = candidate.get("url")
+                    if isinstance(url, str) and url.startswith(("http://", "https://")):
+                        sources.append(
+                            {"title": str(candidate.get("title") or "未命名来源"), "url": url}
+                        )
+        answer = "\n".join(texts).strip()
+        if not answer:
+            raise DeepSeekAPIError("DeepSeek Responses 返回了空回复")
+        return answer, used_web, sources, actions
+
+    def _log_web_search(
+        self, used_web: bool, sources: list[dict], actions: list[dict]
+    ) -> None:
+        if not used_web:
+            logger.info("DeepSeek 本次回答未使用联网搜索。")
+            return
+        if not self.web_search_log_sources:
+            logger.info("DeepSeek 已执行联网搜索；来源日志已关闭。")
+            return
+        unique: list[dict] = []
+        seen_urls: set[str] = set()
+        for source in sources:
+            url = source["url"]
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            unique.append(source)
+        limit = self.web_search_max_log_sources
+        if limit == 0:
+            logger.info("DeepSeek 已执行联网搜索；来源 URL 记录上限为 0。")
+            return
+        if unique and limit:
+            logger.info("DeepSeek 已执行联网搜索，来源（最多 %s 条）：", limit)
+            for source in unique[:limit]:
+                safe_title = self._sanitize_web_context(source["title"][:120])
+                safe_url = self._sanitize_log_url(source["url"])
+                logger.info("- %s：%s", safe_title, safe_url)
+            return
+        action_types = sorted(
+            {str(action.get("type") or "unknown") for action in actions}
+        )
+        logger.info(
+            "DeepSeek 已执行联网搜索，但接口未返回来源 URL；搜索动作：%s",
+            ", ".join(action_types) if action_types else "未提供",
+        )
+
+    @staticmethod
+    def _strip_source_links(answer: str) -> str:
+        answer = _MARKDOWN_URL_PATTERN.sub(r"\1", answer)
+        answer = _PLAIN_URL_PATTERN.sub("", answer)
+        return re.sub(r"[ \t]+\n", "\n", answer).strip()
+
+    @staticmethod
+    def _sanitize_log_url(value: str) -> str:
+        parsed = urlparse(value)
+        without_private_query = parsed._replace(query="", fragment="")
+        return _LONG_NUMBER_PATTERN.sub(
+            "[数字标识已隐藏]", urlunparse(without_private_query)
+        )
 
     @staticmethod
     def _content(payload: dict) -> str:
@@ -549,7 +792,7 @@ class QQBot:
         )
         logger.info(
             "配置已加载：工作时段 %s-%s，主动回复%s（每日随机上限 %s-%s），"
-            "群聊上下文 %s 秒/%s 条，对话%s，未来记忆%s",
+            "群聊上下文 %s 秒/%s 条，对话%s，未来记忆%s，联网搜索%s",
             _format_time(self.config.answer_start_minutes),
             _format_time(self.config.answer_end_minutes),
             "启用" if self.config.spontaneous_replies_enabled else "禁用",
@@ -559,6 +802,7 @@ class QQBot:
             self.config.group_context_max_messages,
             history_ttl,
             "启用" if self.config.future_memory_enabled else "禁用",
+            "启用" if self.config.web_search_enabled else "禁用",
         )
         logger.info("正在连接 NapCat（%s）...", self.log_url)
         if not self.config.active_group_ids:
@@ -733,7 +977,20 @@ class QQBot:
                 group_id, user_id, extract_mentioned_ids(payload, self_id), question, now
             )
             try:
-                answer = await self.llm_client.chat(history, question, context=context)
+                answer = await self.llm_client.chat(
+                    history, question, context=context, now=now
+                )
+            except DeepSeekWebSearchError:
+                logger.exception("DeepSeek 联网回答失败")
+                await self._send_group_message(
+                    ws,
+                    group_id,
+                    self.config.web_search_failure_reply,
+                    pending,
+                    now=now,
+                    spontaneous=spontaneous,
+                )
+                return
             except Exception:  # noqa: BLE001
                 logger.exception("调用 DeepSeek 失败")
                 await self._send_group_message(
@@ -1221,6 +1478,10 @@ def main() -> int:
         system_prompt=deepseek_system_prompt,
         timeout_seconds=config.deepseek_timeout_seconds,
         max_tokens=config.deepseek_max_tokens,
+        web_search_enabled=config.web_search_enabled,
+        web_search_timeout_seconds=config.web_search_timeout_seconds,
+        web_search_log_sources=config.web_search_log_sources,
+        web_search_max_log_sources=config.web_search_max_log_sources,
     )
     bot = QQBot(
         napcat_ws_url,

@@ -1,6 +1,6 @@
 # QQ 群智能 DeepSeek 机器人（Python 版）
 
-这是一个通过 NapCat（OneBot v11）接入 QQ 群、使用 DeepSeek 生成回复的机器人。它拥有模拟作息、群成员身份识别、有限聊天上下文、永久群资料和未来事项提醒。
+这是一个通过 NapCat（OneBot v11）接入 QQ 群、使用 DeepSeek 生成回复的机器人。它拥有模拟作息、群成员身份识别、有限聊天上下文、永久群资料和未来事项提醒。下面的介绍全是ai生成的，实用的介绍和部署方式还在锐意制作中。。。
 
 ## 主要能力
 
@@ -116,7 +116,9 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-兼容服务商可以替换接口地址和模型名。真实密钥不得写入代码、文档或提交到 GitHub。
+`deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通问题由模型判断是否联网，明确要求搜索和询问当前时间会强制联网核验。天气、新闻等实时信息和本地未来事项中没有记录的外部事件均可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
+
+关闭 `WEB_SEARCH_ENABLED` 后，群聊恢复使用 Chat Completions；未来事项的结构化提取始终使用 Chat Completions。兼容服务商若不支持 `/responses` 和 `web_search`，应关闭联网功能。真实密钥不得写入代码、文档或提交到 GitHub。
 
 ## 完整配置表
 
@@ -131,6 +133,11 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `DEEPSEEK_SYSTEM_PROMPT` | 中文群聊助手提示词 | 机器人角色设定 |
 | `DEEPSEEK_TIMEOUT_SECONDS` | `60` | 单次 DeepSeek 请求超时 |
 | `DEEPSEEK_MAX_TOKENS` | `1024` | 聊天回复最大生成 token 数 |
+| `WEB_SEARCH_ENABLED` | `true` | 是否让群聊回答使用 Responses API 和服务端联网搜索 |
+| `WEB_SEARCH_TIMEOUT_SECONDS` | `90` | 联网回答请求超时；必须大于 0 |
+| `WEB_SEARCH_FAILURE_REPLY` | `我不知道，暂时没有查到可靠的联网信息。` | 联网失败、不完整或无法核验时的群内提示 |
+| `WEB_SEARCH_LOG_SOURCES` | `true` | 是否在 PowerShell 中记录搜索来源，不影响群内回复 |
+| `WEB_SEARCH_MAX_LOG_SOURCES` | `5` | 单次最多记录的来源数量；`0` 不打印来源 URL |
 | `BOT_TIMEZONE` | `Asia/Shanghai` | 作息和提醒时区 |
 | `ANSWER_START_TIME` / `ANSWER_END_TIME` | `10:00` / `19:00` | 分钟级工作时段；结束时间必须更晚，`24:00` 仅可用于结束 |
 | `SPONTANEOUS_REPLIES_ENABLED` | `true` | 是否允许算法主动插话 |
@@ -161,6 +168,8 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `EMPTY_MENTION_REPLY` / `AI_ERROR_REPLY` | 内置中文提示 | 空 @ 和 AI 故障时的回复文本 |
 
 布尔值可写 `true/false`、`1/0`、`yes/no` 或 `on/off`。配置使用严格校验：格式错误、范围倒置、无效时区或权重之和不为 1 时，程序会在连接 NapCat 前退出并指出变量名。`FUTURE_MEMORY_ENABLED=false` 会同时停止新事项提取、事项上下文注入和主动提醒。旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR` 和 `SPONTANEOUS_DAILY_LIMIT` 已废弃。
+
+联网请求只带当前问题、有限对话历史和按需检索的本地资料，并会隐藏其中的 QQ 数字标识；不会发送完整群成员名单。DeepSeek 若没有返回 URL 注解，日志只说明执行过哪些搜索动作。联网功能会增加响应时间和 API 用量。
 
 ## 启动与测试
 
