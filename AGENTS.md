@@ -3,11 +3,11 @@
 ## 1. 项目目标与当前状态
 
 - 项目名：`qqrobottext`，Python 3.10+ 的 QQ 群聊机器人。
-- 功能开发分支：`智能ai分支`，跟踪 `origin/智能ai分支`；PR #1 已把截至 `ca0b98e` 的功能合入 `main`，后续配置与文档提交也将按用户要求同步到 `main`。
-- `main` 和 `智能ai分支` 都是远端有效分支。开始工作前必须先 `git fetch origin` 并检查双方状态，不要假定或硬编码分支头提交。
-- 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek OpenAI 兼容 Chat Completions API。
+- 当前开发分支：`联网信息`，从已合并智能功能的 `main` 创建并跟踪 `origin/联网信息`。`main`、`智能ai分支` 和 `联网信息` 都是远端有效分支。
+- 开始工作前必须先 `git fetch origin` 并检查目标分支状态，不要假定或硬编码分支头提交。
+- 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek Responses API（群聊与联网）/ Chat Completions API（未来事项提取及关闭联网后的聊天）。
 - 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、@回答、算法主动插话、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
-- 最近功能版本：`8afeadc`，已完成行为参数 `.env` 化、严格配置校验和每日随机主动回复上限。
+- `联网信息` 工作树在 `main` 基础上增加 Responses API 的服务端 `web_search`；是否提交或推送必须遵守当次用户要求。
 - 自动化测试不连接真实 QQ，也不调用 DeepSeek；配置升级后的真实群聊端到端验证仍需人工执行。
 
 ## 2. 代码地图与启动命令
@@ -49,6 +49,8 @@ cd D:\codex\qqrobot
 
 - 默认主动回复日上限不是固定值：每群每天从 `SPONTANEOUS_DAILY_MIN=60` 到 `SPONTANEOUS_DAILY_MAX=100` 随机抽取并持久化；@回复、问候和提醒不计入。
 - `FUTURE_MEMORY_SOURCE=active_window_all` 会分析工作时段内全部日期候选消息；`participated` 只分析机器人实际参与的消息。`FUTURE_MEMORY_ENABLED=false` 同时关闭提取、上下文注入和提醒。
+- `WEB_SEARCH_ENABLED=true` 时群聊走 `/responses`：普通问题使用 `tool_choice=auto`，明确联网搜索或当前时间问题强制 `web_search`；关闭后回退到原 `/chat/completions`。
+- 联网失败、不完整或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得改用未经核验的实时答案。来源只按 `WEB_SEARCH_LOG_SOURCES` 和 `WEB_SEARCH_MAX_LOG_SOURCES` 写入后端日志。
 - 早晚问候模板使用 `||` 分隔；模板、开关、上下文窗口、提醒区间和所有用户行为参数均以 `.env.example` 为准。
 
 ## 4. 消息与并发流程
@@ -57,9 +59,10 @@ cd D:\codex\qqrobot
 2. `_handle_group_message()` 先验证白名单、排除机器人自身消息，再记录最近群聊和提醒确认；工作时段外立即静默。
 3. 工作时段内，@消息必答；普通文字消息在群级锁内执行每日上限、最小间隔和评分判断。
 4. `_answer_message()` 使用 `(group_id, user_id)` 对话锁隔离历史；历史同时受条数和闲置 TTL 限制。
-5. `_build_group_context()` 按需加入发言者、群主/管理员、明确 @ 或名称命中的成员、有效未来事项及近期群聊，不允许把完整大群名册塞进每次 API 请求。
+5. `_build_group_context()` 按需加入发言者、群主/管理员、明确 @ 或名称命中的成员、有效未来事项及近期群聊，不允许把完整大群名册塞进每次 API 请求；联网路径还会隐藏 QQ 数字标识。
 6. DeepSeek 成功后才更新对话历史；所有成功发送的机器人消息更新沉默时间，只有算法主动插话增加主动回复计数。
 7. 日期关键词先经本地正则过滤，再在独立 Semaphore 内调用 DeepSeek 提取结构化事项。
+8. 联网回答解析 `/responses.output` 中的 `message/output_text`，忽略 reasoning；搜索来源 URL 只打印到 PowerShell，不拼进 QQ 回复。接口未返回 URL 时只记录搜索动作类型。
 
 并发不变量：
 
@@ -100,6 +103,7 @@ cd D:\codex\qqrobot
 - 永远不要读取后输出或提交真实 `DEEPSEEK_API_KEY`、`NAPCAT_WS_TOKEN`、群号白名单、SQLite 内容或 `qq/napcat/config/webui.json`。
 - `.env`、`data/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore` 中。
 - 测试只使用临时 SQLite、模拟 WebSocket 和模拟 DeepSeek；不得向真实群发消息或消耗真实 API 额度。
+- 联网测试必须覆盖 `auto`/强制工具选择、响应状态、多段 `output_text`、URL 注解、QQ 号脱敏、来源不进入群回复和失败提示。
 - 修改后至少执行：完整单元测试、`py_compile`、`git diff --check`、Git 状态检查和暂存区敏感值扫描。
 - 配置新增/改名时必须同步修改 `.env.example`、README 配置表、`BotConfig` 严格校验和配置测试。
 - 数据库字段变化必须提供针对旧 schema 的无损迁移测试。

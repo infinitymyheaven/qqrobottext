@@ -16,6 +16,7 @@ from src.bot import (
     BotConfig,
     ConfigError,
     DeepSeekClient,
+    DeepSeekWebSearchError,
     OneBotActionError,
     QQBot,
     extract_mentioned_ids,
@@ -79,13 +80,18 @@ class FakeLLM:
         self.extract_calls = []
         self.events = events or []
 
-    async def chat(self, history, user_text, *, context=""):
-        self.chat_calls.append((list(history), user_text, context))
+    async def chat(self, history, user_text, *, context="", now=None):
+        self.chat_calls.append((list(history), user_text, context, now))
         return f"AI:{user_text}"
 
     async def extract_future_events(self, text, now):
         self.extract_calls.append((text, now))
         return list(self.events)
+
+
+class FailingWebLLM(FakeLLM):
+    async def chat(self, history, user_text, *, context="", now=None):
+        raise DeepSeekWebSearchError("模拟联网失败")
 
 
 class FixedRNG:
@@ -151,12 +157,114 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             captured["timeout"] = timeout
             return FakeHTTPResponse({"choices": [{"message": {"content": "回复"}}]})
 
-        client = DeepSeekClient("test-key", model="test-model", timeout_seconds=12)
+        client = DeepSeekClient(
+            "test-key", model="test-model", timeout_seconds=12, web_search_enabled=False
+        )
         with patch("src.bot.urlopen", fake_urlopen):
             answer = await client.chat([], "谁是群主", context="张三是群主")
         self.assertEqual(answer, "回复")
         self.assertIn("张三是群主", captured["body"]["messages"][1]["content"])
         self.assertEqual(captured["timeout"], 12)
+
+    async def test_web_chat_uses_responses_auto_and_sanitizes_context(self):
+        captured = {}
+        response = {
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "内部推理"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "普通回答"}]},
+            ],
+        }
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return FakeHTTPResponse(response)
+
+        client = DeepSeekClient("test-key", web_search_timeout_seconds=91)
+        with patch("src.bot.urlopen", fake_urlopen):
+            answer = await client.chat(
+                [],
+                "介绍一下这个话题，别泄露 QQ 987654321",
+                context="群主（QQ 123456789，群主）",
+                now=at_time(12, 30),
+            )
+        self.assertEqual(answer, "普通回答")
+        self.assertTrue(captured["url"].endswith("/responses"))
+        self.assertEqual(captured["body"]["tools"], [{"type": "web_search"}])
+        self.assertEqual(captured["body"]["tool_choice"], "auto")
+        self.assertNotIn("123456789", json.dumps(captured["body"], ensure_ascii=False))
+        self.assertNotIn("987654321", json.dumps(captured["body"], ensure_ascii=False))
+        self.assertEqual(captured["timeout"], 91)
+
+    async def test_explicit_search_and_time_force_web_and_log_sources(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "action": {"type": "search"}},
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "现在十二点。 [来源](https://example.com/time)",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/time",
+                                    "title": "时间来源",
+                                }
+                            ],
+                        },
+                        {"type": "output_text", "text": "已经联网核验。"},
+                    ],
+                },
+            ],
+        }
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(response)
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen), self.assertLogs("qqrobot", level="INFO") as logs:
+            answer = await client.chat([], "现在几点了？", now=at_time(12, 30))
+        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
+        self.assertNotIn("https://", answer)
+        self.assertNotIn("内部推理", answer)
+        self.assertIn("https://example.com/time", "\n".join(logs.output))
+
+    async def test_incomplete_web_response_is_an_error(self):
+        client = DeepSeekClient("test-key")
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+        }
+        with patch("src.bot.urlopen", return_value=FakeHTTPResponse(response)):
+            with self.assertRaisesRegex(Exception, "Responses 未完成"):
+                await client.chat([], "查询天气")
+
+    async def test_explicit_search_words_force_web(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "action": {"type": "search"}},
+                {"type": "message", "content": [{"type": "output_text", "text": "已查询"}]},
+            ],
+        }
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeHTTPResponse(response)
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen):
+            await client.chat([], "请联网搜索今天的天气")
+        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
 
     async def test_extract_future_event_json(self):
         response = {
@@ -200,6 +308,17 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.current = at_time(19)
         await self.bot._handle_group_message(self.ws, mention_event("还在吗"), self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
+
+    async def test_web_search_failure_uses_uncertainty_reply(self):
+        self.bot.llm_client = FailingWebLLM()
+        with self.assertLogs("qqrobot", level="ERROR"):
+            await self.bot._handle_group_message(
+                self.ws, mention_event("帮我联网查询天气"), self.pending
+            )
+        self.assertEqual(
+            self.ws.sent[-1]["params"]["message"],
+            self.config.web_search_failure_reply,
+        )
 
     def test_minute_answer_time_boundaries(self):
         self.bot.config = BotConfig(
@@ -522,6 +641,8 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual((config.answer_start_minutes, config.answer_end_minutes), (630, 1155))
         self.assertFalse(config.spontaneous_replies_enabled)
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
+        self.assertTrue(config.web_search_enabled)
+        self.assertEqual(config.web_search_timeout_seconds, 90.0)
 
     def test_legacy_hour_variables_are_ignored(self):
         with patch.dict(
@@ -550,6 +671,9 @@ class ConfigParsingTest(unittest.TestCase):
             {"SPONTANEOUS_DAILY_MIN": "101", "SPONTANEOUS_DAILY_MAX": "100"},
             {"SPONTANEOUS_RANDOM_WEIGHT": "0.5"},
             {"FUTURE_MEMORY_ENABLED": "perhaps"},
+            {"WEB_SEARCH_ENABLED": "perhaps"},
+            {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},
+            {"WEB_SEARCH_MAX_LOG_SOURCES": "-1"},
         )
         for values in invalid_values:
             with self.subTest(values=values), patch.dict(os.environ, values, clear=True):
