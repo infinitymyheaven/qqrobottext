@@ -243,7 +243,49 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("123456789", serialized)
         self.assertNotIn("真实昵称", serialized)
         self.assertNotIn("example.com", serialized)
+        self.assertEqual(captured["body"]["thinking"], {"type": "disabled"})
         self.assertEqual(analyzed["private_message_count"], 1)
+
+    async def test_json_analysis_retries_empty_content_with_more_output_tokens(self):
+        """JSON 模式偶发空回复时应关闭思考、扩大额度并自动恢复。"""
+        bodies = []
+        responses = iter(
+            [
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "", "reasoning_content": "模拟推理"},
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": '{"events": []}'},
+                        }
+                    ]
+                },
+            ]
+        )
+
+        def fake_urlopen(request, timeout):
+            bodies.append(json.loads(request.data.decode("utf-8")))
+            return FakeHTTPResponse(next(responses))
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen):
+            result = await client._json_completion(
+                '请用 JSON 返回 {"events": []}', max_tokens=512
+            )
+
+        self.assertEqual(result, {"events": []})
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0]["thinking"], {"type": "disabled"})
+        self.assertEqual(bodies[0]["max_tokens"], 512)
+        self.assertEqual(bodies[1]["max_tokens"], 1024)
+        self.assertIn("上一次没有得到完整 JSON", bodies[1]["messages"][0]["content"])
 
     async def test_web_chat_uses_responses_auto_and_sanitizes_context(self):
         captured = {}

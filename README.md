@@ -113,6 +113,8 @@ FUTURE_MEMORY_SOURCE=active_window_all
 
 采集器生成的版本默认是 `draft`，不会影响线上机器人。激活或回退后重启机器人生效。NapCat 历史受本机缓存和版本差异影响，命令会报告实际覆盖范围及重复页、离线缺口等情况；`--restart` 可忽略旧断点重新采集。
 
+人格与话题提炼使用 DeepSeek JSON Output，并显式关闭思考模式，把输出额度留给最终结构化结果。若接口偶发返回空内容或 JSON 被截断，程序会自动重试三次并逐次增加输出额度；日志只记录完成原因和是否出现思考内容，不记录聊天证据或模型原文。
+
 ## 安装
 
 环境要求：Python 3.10+、NapCat、DeepSeek API Key。项目依赖 `websockets` 和 Windows 所需的 IANA 时区数据 `tzdata`。

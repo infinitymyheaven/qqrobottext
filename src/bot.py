@@ -1086,26 +1086,85 @@ class DeepSeekClient:
         return decoded
 
     async def _json_completion(self, prompt: str, *, max_tokens: int) -> dict:
-        """执行一次严格 JSON Chat Completions，供低频知识任务复用。"""
-        payload = await asyncio.to_thread(
-            self._post,
-            {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "max_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
-            },
-            self.endpoint,
-            self.timeout_seconds,
+        """执行可恢复的严格 JSON 请求，供低频知识与人格分析复用。"""
+
+        # 结构化提炼不需要长思维链。DeepSeek V4 默认开启思考模式，若推理耗尽
+        # max_tokens，接口可能只返回 reasoning_content 而让最终 content 为空。
+        # 这里显式关闭思考，并在 JSON 模式偶发空回复或截断时有限重试。
+        attempts = 3
+        output_limit = max(512, max_tokens)
+        last_diagnostic = "未取得响应"
+        for attempt in range(1, attempts + 1):
+            retry_instruction = ""
+            if attempt > 1:
+                retry_instruction = (
+                    "\n上一次没有得到完整 JSON。请缩短描述和样例，"
+                    "直接从 { 开始输出一个紧凑、完整的 JSON 对象，不要输出解释。"
+                )
+            payload = await asyncio.to_thread(
+                self._post,
+                {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "user", "content": prompt + retry_instruction}
+                    ],
+                    "stream": False,
+                    "max_tokens": output_limit,
+                    "response_format": {"type": "json_object"},
+                    # 关闭思考能把输出额度留给最终 JSON，并降低采集成本和延迟。
+                    "thinking": {"type": "disabled"},
+                },
+                self.endpoint,
+                self.timeout_seconds,
+            )
+
+            # 只读取结构字段生成诊断信息，绝不把模型内容或聊天证据写入日志。
+            choices = payload.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            if not isinstance(choice, dict):
+                raise DeepSeekAPIError("DeepSeek 返回了无法识别的数据")
+            message = choice.get("message")
+            if not isinstance(message, dict):
+                raise DeepSeekAPIError("DeepSeek 返回了无法识别的数据")
+            content = message.get("content")
+            finish_reason = str(choice.get("finish_reason") or "unknown")
+            reasoning_present = bool(str(message.get("reasoning_content") or "").strip())
+            last_diagnostic = (
+                f"finish_reason={finish_reason}, "
+                f"reasoning_content={'有' if reasoning_present else '无'}"
+            )
+
+            # 空 content 是 DeepSeek JSON Output 的已知偶发现象；下一轮扩大额度重试。
+            if not isinstance(content, str) or not content.strip():
+                if attempt < attempts:
+                    logger.warning(
+                        "DeepSeek JSON 分析第 %s 次返回空内容，正在安全重试（%s）。",
+                        attempt,
+                        last_diagnostic,
+                    )
+                    output_limit = min(output_limit * 2, 8192)
+                    continue
+                break
+            try:
+                decoded = json.loads(self._strip_code_fence(content))
+            except json.JSONDecodeError:
+                last_diagnostic = f"finish_reason={finish_reason}, JSON 不完整"
+                if attempt < attempts:
+                    logger.warning(
+                        "DeepSeek JSON 分析第 %s 次结果不完整，正在安全重试（%s）。",
+                        attempt,
+                        last_diagnostic,
+                    )
+                    output_limit = min(output_limit * 2, 8192)
+                    continue
+                break
+            if not isinstance(decoded, dict):
+                raise DeepSeekAPIError("DeepSeek 知识分析结果必须是 JSON 对象")
+            return decoded
+
+        raise DeepSeekAPIError(
+            f"DeepSeek JSON 分析连续 {attempts} 次未返回完整内容（{last_diagnostic}）"
         )
-        try:
-            decoded = json.loads(self._strip_code_fence(self._content(payload)))
-        except json.JSONDecodeError as exc:
-            raise DeepSeekAPIError("DeepSeek 知识分析结果不是有效 JSON") from exc
-        if not isinstance(decoded, dict):
-            raise DeepSeekAPIError("DeepSeek 知识分析结果必须是 JSON 对象")
-        return decoded
 
     @staticmethod
     def _strip_code_fence(content: str) -> str:
