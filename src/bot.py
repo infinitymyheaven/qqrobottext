@@ -25,8 +25,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import websockets
 
 if __package__:
+    from .error_logging import install_error_context_handler
     from .memory import MemoryStore
 else:  # 支持 README 中的 `python src\bot.py` 直接启动方式。
+    from error_logging import install_error_context_handler
     from memory import MemoryStore
 
 RETRY_DELAY_SECONDS = 3.0
@@ -39,6 +41,7 @@ DEFAULT_ERROR_REPLY = "抱歉，AI 服务暂时不可用，请稍后再试。"
 DEFAULT_WEB_SEARCH_FAILURE_REPLY = "我不知道，暂时没有查到可靠的联网信息。"
 DEFAULT_EMPTY_REPLY = "请在 @ 我后输入想聊的内容。"
 DEFAULT_DB_PATH = "data/bot_memory.sqlite3"
+DEFAULT_ERROR_LOG_PATH = "logs/error_context.txt"
 ENV_FILE = Path(".env")
 
 MORNING_MESSAGES = (
@@ -278,6 +281,12 @@ class BotConfig:
     web_search_timeout_seconds: float = 90.0
     web_search_log_sources: bool = True
     web_search_max_log_sources: int = 5
+    error_log_enabled: bool = True
+    error_log_path: str = DEFAULT_ERROR_LOG_PATH
+    error_log_before_records: int = 30
+    error_log_after_records: int = 10
+    error_log_max_bytes: int = 1_048_576
+    error_log_backup_count: int = 2
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -321,6 +330,9 @@ class BotConfig:
         memory_path = (os.getenv("MEMORY_DB_PATH") or DEFAULT_DB_PATH).strip()
         if not memory_path:
             raise ConfigError("MEMORY_DB_PATH 不能为空")
+        error_log_path = (os.getenv("ERROR_LOG_PATH") or DEFAULT_ERROR_LOG_PATH).strip()
+        if not error_log_path:
+            raise ConfigError("ERROR_LOG_PATH 不能为空")
         return cls(
             active_group_ids=group_ids,
             timezone=timezone,
@@ -399,6 +411,20 @@ class BotConfig:
             web_search_log_sources=_env_bool("WEB_SEARCH_LOG_SOURCES", True),
             web_search_max_log_sources=_env_int(
                 "WEB_SEARCH_MAX_LOG_SOURCES", 5, minimum=0
+            ),
+            error_log_enabled=_env_bool("ERROR_LOG_ENABLED", True),
+            error_log_path=error_log_path,
+            error_log_before_records=_env_int(
+                "ERROR_LOG_BEFORE_RECORDS", 30, minimum=0
+            ),
+            error_log_after_records=_env_int(
+                "ERROR_LOG_AFTER_RECORDS", 10, minimum=0
+            ),
+            error_log_max_bytes=_env_int(
+                "ERROR_LOG_MAX_BYTES", 1_048_576, minimum=1024
+            ),
+            error_log_backup_count=_env_int(
+                "ERROR_LOG_BACKUP_COUNT", 2, minimum=0
             ),
         )
 
@@ -1467,6 +1493,20 @@ def main() -> int:
     except ConfigError as exc:
         logger.error("配置错误：%s", exc)
         return 2
+    if config.error_log_enabled:
+        install_error_context_handler(
+            config.error_log_path,
+            before_records=config.error_log_before_records,
+            after_records=config.error_log_after_records,
+            max_bytes=config.error_log_max_bytes,
+            backup_count=config.error_log_backup_count,
+        )
+        logger.info(
+            "错误现场日志已启用：仅在报错时写入 %s（前 %s 条，后 %s 条）",
+            config.error_log_path,
+            config.error_log_before_records,
+            config.error_log_after_records,
+        )
     api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
         logger.error("缺少 DEEPSEEK_API_KEY，请在 .env 中填写 DeepSeek API Key。")
@@ -1493,6 +1533,9 @@ def main() -> int:
         asyncio.run(bot.run())
     except KeyboardInterrupt:
         logger.info("已手动退出。")
+    except Exception:
+        logger.exception("机器人因未处理异常停止")
+        return 1
     return 0
 
 

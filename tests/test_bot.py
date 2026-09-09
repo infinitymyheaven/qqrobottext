@@ -635,6 +635,12 @@ class ConfigParsingTest(unittest.TestCase):
             "SPONTANEOUS_DAILY_MAX": "100",
             "SPONTANEOUS_REPLIES_ENABLED": "off",
             "MORNING_GREETING_MESSAGES": "早安一||早安二",
+            "ERROR_LOG_ENABLED": "yes",
+            "ERROR_LOG_PATH": "runtime/custom-errors.txt",
+            "ERROR_LOG_BEFORE_RECORDS": "12",
+            "ERROR_LOG_AFTER_RECORDS": "4",
+            "ERROR_LOG_MAX_BYTES": "4096",
+            "ERROR_LOG_BACKUP_COUNT": "1",
         }
         with patch.dict(os.environ, values, clear=True):
             config = BotConfig.from_env()
@@ -643,6 +649,12 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
         self.assertTrue(config.web_search_enabled)
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
+        self.assertTrue(config.error_log_enabled)
+        self.assertEqual(config.error_log_path, "runtime/custom-errors.txt")
+        self.assertEqual(config.error_log_before_records, 12)
+        self.assertEqual(config.error_log_after_records, 4)
+        self.assertEqual(config.error_log_max_bytes, 4096)
+        self.assertEqual(config.error_log_backup_count, 1)
 
     def test_legacy_hour_variables_are_ignored(self):
         with patch.dict(
@@ -674,6 +686,10 @@ class ConfigParsingTest(unittest.TestCase):
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},
             {"WEB_SEARCH_MAX_LOG_SOURCES": "-1"},
+            {"ERROR_LOG_ENABLED": "perhaps"},
+            {"ERROR_LOG_PATH": "   "},
+            {"ERROR_LOG_BEFORE_RECORDS": "-1"},
+            {"ERROR_LOG_MAX_BYTES": "1023"},
         )
         for values in invalid_values:
             with self.subTest(values=values), patch.dict(os.environ, values, clear=True):

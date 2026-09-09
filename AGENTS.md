@@ -3,17 +3,18 @@
 ## 1. 项目目标与当前状态
 
 - 项目名：`qqrobottext`，Python 3.10+ 的 QQ 群聊机器人。
-- 当前开发分支：`联网信息`，从已合并智能功能的 `main` 创建并跟踪 `origin/联网信息`。`main`、`智能ai分支` 和 `联网信息` 都是远端有效分支。
+- 当前开发分支：`main`，跟踪 `origin/main`。`main`、`智能ai分支` 和 `联网信息` 都是远端有效分支。
 - 开始工作前必须先 `git fetch origin` 并检查目标分支状态，不要假定或硬编码分支头提交。
 - 运行架构：NapCat OneBot v11 正向 WebSocket → 本项目 Python 客户端 → DeepSeek Responses API（群聊与联网）/ Chat Completions API（未来事项提取及关闭联网后的聊天）。
 - 当前能力：白名单群控制、完整群成员同步、角色/头衔长期记忆、分钟级作息、@回答、算法主动插话、近期群聊上下文、逐成员对话上下文、未来事项提取与提醒。
-- `联网信息` 工作树在 `main` 基础上增加 Responses API 的服务端 `web_search`；是否提交或推送必须遵守当次用户要求。
+- PR #2 已将 `联网信息` 的 Responses API 服务端 `web_search` 能力合入 `main`。
 - 自动化测试不连接真实 QQ，也不调用 DeepSeek；配置升级后的真实群聊端到端验证仍需人工执行。
 
 ## 2. 代码地图与启动命令
 
 - `src/bot.py`：`.env` 读取与校验、DeepSeek HTTP 客户端、OneBot WebSocket、消息处理、上下文构造、主动回复算法、成员同步和提醒调度。
 - `src/memory.py`：SQLite 建表/迁移以及成员资料、资料历史、未来事项和每日活动读写。
+- `src/error_logging.py`：内存环形状态缓冲、ERROR 触发的前后文 txt 写入及限额轮换。
 - `tests/test_bot.py`：消息解析、配置、时间边界、上下文、同步、问候、主动回复和提醒测试。
 - `tests/test_memory.py`：成员历史、退群状态、事项去重、每日随机上限和旧库迁移测试。
 - `.env.example`：所有公开配置及默认值的唯一权威模板；README 里的配置表必须与它同步。
@@ -52,6 +53,7 @@ cd D:\codex\qqrobot
 - `WEB_SEARCH_ENABLED=true` 时群聊走 `/responses`：普通问题使用 `tool_choice=auto`，明确联网搜索或当前时间问题强制 `web_search`；关闭后回退到原 `/chat/completions`。
 - 联网失败、不完整或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得改用未经核验的实时答案。来源只按 `WEB_SEARCH_LOG_SOURCES` 和 `WEB_SEARCH_MAX_LOG_SOURCES` 写入后端日志。
 - 早晚问候模板使用 `||` 分隔；模板、开关、上下文窗口、提醒区间和所有用户行为参数均以 `.env.example` 为准。
+- 错误现场日志默认只在内存保留最近 30 条状态；`ERROR` 才写入错误前 30 条、错误堆栈和后 10 条。默认单文件 1 MiB、保留 2 个轮换文件，路径为被忽略的 `logs/error_context.txt`。不要改成全量文件日志。
 
 ## 4. 消息与并发流程
 
@@ -101,7 +103,7 @@ cd D:\codex\qqrobot
 ## 7. 安全、测试与发布清单
 
 - 永远不要读取后输出或提交真实 `DEEPSEEK_API_KEY`、`NAPCAT_WS_TOKEN`、群号白名单、SQLite 内容或 `qq/napcat/config/webui.json`。
-- `.env`、`data/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore` 中。
+- `.env`、`data/`、`logs/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore` 中。
 - 测试只使用临时 SQLite、模拟 WebSocket 和模拟 DeepSeek；不得向真实群发消息或消耗真实 API 额度。
 - 联网测试必须覆盖 `auto`/强制工具选择、响应状态、多段 `output_text`、URL 注解、QQ 号脱敏、来源不进入群回复和失败提示。
 - 修改后至少执行：完整单元测试、`py_compile`、`git diff --check`、Git 状态检查和暂存区敏感值扫描。

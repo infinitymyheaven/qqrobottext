@@ -166,10 +166,20 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `MORNING_GREETING_ENABLED` / `NIGHT_GREETING_ENABLED` | `true` / `true` | 是否发送上下班问候 |
 | `MORNING_GREETING_MESSAGES` / `NIGHT_GREETING_MESSAGES` | 内置三条模板 | 使用 `||` 分隔多条随机模板 |
 | `EMPTY_MENTION_REPLY` / `AI_ERROR_REPLY` | 内置中文提示 | 空 @ 和 AI 故障时的回复文本 |
+| `ERROR_LOG_ENABLED` | `true` | 是否启用只在报错时落盘的错误现场日志 |
+| `ERROR_LOG_PATH` | `logs/error_context.txt` | 错误现场 txt 路径；目录会按需创建 |
+| `ERROR_LOG_BEFORE_RECORDS` / `ERROR_LOG_AFTER_RECORDS` | `30` / `10` | 每次错误保存的前后状态条数 |
+| `ERROR_LOG_MAX_BYTES` / `ERROR_LOG_BACKUP_COUNT` | `1048576` / `2` | 单文件空间上限与旧文件保留数量 |
 
 布尔值可写 `true/false`、`1/0`、`yes/no` 或 `on/off`。配置使用严格校验：格式错误、范围倒置、无效时区或权重之和不为 1 时，程序会在连接 NapCat 前退出并指出变量名。`FUTURE_MEMORY_ENABLED=false` 会同时停止新事项提取、事项上下文注入和主动提醒。旧变量 `ANSWER_START_HOUR`、`ANSWER_END_HOUR` 和 `SPONTANEOUS_DAILY_LIMIT` 已废弃。
 
 联网请求只带当前问题、有限对话历史和按需检索的本地资料，并会隐藏其中的 QQ 数字标识；不会发送完整群成员名单。DeepSeek 若没有返回 URL 注解，日志只说明执行过哪些搜索动作。联网功能会增加响应时间和 API 用量。
+
+## 错误现场日志
+
+控制台仍实时显示运行状态，但普通日志不会持续写入硬盘。程序只在出现 `ERROR` 或异常堆栈时创建 `logs/error_context.txt`，保存错误前后的有限日志以及进程、线程、Python 版本、运行时长和工作目录。文件达到配置的空间上限后自动轮换，最多保留指定数量的旧文件；`logs/` 已被 Git 忽略。
+
+如果机器人正常运行且从未出现错误，看不到该 txt 文件属于正常现象。修改日志配置后需要重启机器人。
 
 ## 启动与测试
 
