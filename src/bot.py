@@ -214,6 +214,23 @@ class DeepSeekAPIError(RuntimeError):
     pass
 
 
+class OneBotActionError(RuntimeError):
+    """NapCat 接受了动作请求，但 OneBot 返回了失败结果。"""
+
+    def __init__(self, retcode, message: str):
+        self.retcode = retcode
+        self.message = message
+        super().__init__(f"OneBot 动作失败（retcode={retcode}）：{message}")
+
+
+def _onebot_failure_message(payload: dict) -> str:
+    raw = str(payload.get("message") or payload.get("wording") or "未知错误")
+    nested = re.search(r'"errMsg"\s*:\s*"([^"]+)"', raw)
+    if nested:
+        return nested.group(1)
+    return raw.splitlines()[0][:300]
+
+
 class DeepSeekClient:
     """DeepSeek OpenAI 兼容客户端，支持聊天和未来日期结构化提取。"""
 
@@ -340,6 +357,9 @@ class QQBot:
         self._extraction_semaphore = asyncio.Semaphore(2)
         self._recent_messages: defaultdict[str, deque] = defaultdict(deque)
         self._refresh_tasks: dict[str, asyncio.Task] = {}
+        # 白名单只是用户授权范围；实际发送前还必须由 get_group_list 或群事件
+        # 确认机器人当前确实在群内，防止对尚未加入/已被移出的群反复发送。
+        self._joined_group_ids: set[str] = set()
 
     def now(self) -> datetime:
         value = self._now_provider()
@@ -378,6 +398,7 @@ class QQBot:
         workers: list[asyncio.Task] = []
         try:
             if self.config.active_group_ids:
+                self._joined_group_ids.clear()
                 await self._sync_all_groups(ws, pending)
                 workers = [
                     asyncio.create_task(self._periodic_sync_loop(ws, pending)),
@@ -418,7 +439,11 @@ class QQBot:
                         if payload.get("status") == "ok" and payload.get("retcode") == 0:
                             future.set_result(payload)
                         else:
-                            future.set_exception(RuntimeError(f"动作失败：{json.dumps(payload, ensure_ascii=False)}"))
+                            future.set_exception(
+                                OneBotActionError(
+                                    payload.get("retcode"), _onebot_failure_message(payload)
+                                )
+                            )
                     continue
 
                 task = None
@@ -444,6 +469,8 @@ class QQBot:
             self_id = str(payload.get("self_id") or "")
             if group_id not in self.config.active_group_ids or not user_id or user_id == self_id:
                 return
+            # 能收到这个群的消息，本身就是机器人仍在群内的实时证明。
+            self._joined_group_ids.add(group_id)
 
             now = self.now()
             self.memory.acknowledge_user(group_id, user_id, now.timestamp())
@@ -686,6 +713,14 @@ class QQBot:
         group_id = str(payload.get("group_id") or "")
         if group_id not in self.config.active_group_ids:
             return
+        if (
+            payload.get("notice_type") == "group_decrease"
+            and str(payload.get("user_id") or "") == str(payload.get("self_id") or "")
+        ):
+            self._joined_group_ids.discard(group_id)
+            logger.warning("机器人已离开白名单群 %s，暂停该群的主动发送", group_id)
+            return
+        self._joined_group_ids.add(group_id)
         if payload.get("notice_type") not in {
             "group_increase",
             "group_decrease",
@@ -718,9 +753,19 @@ class QQBot:
                     for group in groups
                     if isinstance(group, dict)
                 }
+                joined = self.config.active_group_ids.intersection(names)
+                self._joined_group_ids = set(joined)
+                missing = self.config.active_group_ids.difference(joined)
+                for group_id in sorted(missing):
+                    logger.warning(
+                        "白名单群 %s 不在机器人当前群列表中，跳过同步和主动发送",
+                        group_id,
+                    )
+            else:
+                raise RuntimeError("群列表响应不是数组")
         except Exception:  # noqa: BLE001
-            logger.exception("获取群列表失败，将继续按白名单同步")
-        for group_id in self.config.active_group_ids:
+            logger.exception("获取群列表失败，仅保留已经确认在群内的群")
+        for group_id in sorted(self._joined_group_ids):
             await self._sync_group(ws, pending, group_id, names.get(group_id, ""))
 
     async def _sync_group(
@@ -754,25 +799,26 @@ class QQBot:
         now = self.now()
         local_date = now.date().isoformat()
         active = self.is_answer_time(now)
-        for group_id in self.config.active_group_ids:
+        for group_id in sorted(self._joined_group_ids):
             async with self._group_reply_locks[group_id]:
                 activity = self.memory.get_activity(group_id, local_date)
                 if active and not activity["morning_sent"]:
-                    await self._send_group_message(
+                    if not await self._send_scheduled_message(
                         ws,
                         group_id,
                         self.rng.choice(MORNING_MESSAGES),
                         pending,
                         now=now,
                         morning=True,
-                    )
+                    ):
+                        continue
                 if (
                     not active
                     and now.hour == self.config.answer_end_hour
                     and now.minute < 10
                     and not activity["night_sent"]
                 ):
-                    await self._send_group_message(
+                    await self._send_scheduled_message(
                         ws,
                         group_id,
                         self.rng.choice(NIGHT_MESSAGES),
@@ -784,14 +830,16 @@ class QQBot:
         if not active:
             return
         for event in self.memory.due_initial_reminders(now.timestamp()):
-            if event["group_id"] not in self.config.active_group_ids:
+            if event["group_id"] not in self._joined_group_ids:
                 continue
             event_time = datetime.fromtimestamp(event["event_at"], self.config.timezone)
             message = f"提醒一下：{event['summary']}（时间：{event_time:%Y-%m-%d %H:%M}）"
             async with self._group_reply_locks[event["group_id"]]:
-                await self._send_group_message(
+                sent = await self._send_scheduled_message(
                     ws, event["group_id"], message, pending, now=now
                 )
+                if not sent:
+                    continue
                 followup = now + timedelta(hours=self.rng.uniform(2, 5))
                 followup = self._adjust_to_next_answer_time(followup)
                 self.memory.mark_reminded(
@@ -799,17 +847,33 @@ class QQBot:
                 )
 
         for event in self.memory.due_followups(now.timestamp()):
-            if event["group_id"] not in self.config.active_group_ids:
+            if event["group_id"] not in self._joined_group_ids:
                 continue
             message = [
                 {"type": "at", "data": {"qq": event["source_user_id"]}},
                 {"type": "text", "data": {"text": f" 之前提醒的事项还没有看到回复：{event['summary']}"}},
             ]
             async with self._group_reply_locks[event["group_id"]]:
-                await self._send_group_message(
+                sent = await self._send_scheduled_message(
                     ws, event["group_id"], message, pending, now=now
                 )
-                self.memory.mark_followup_sent(event["id"], now.timestamp())
+                if sent:
+                    self.memory.mark_followup_sent(event["id"], now.timestamp())
+
+    async def _send_scheduled_message(
+        self, ws, group_id: str, message, pending: dict, **kwargs
+    ) -> bool:
+        """定时任务发送失败时隔离单个群，不让调度器触发整条连接重建。"""
+        try:
+            await self._send_group_message(ws, group_id, message, pending, **kwargs)
+            return True
+        except OneBotActionError as exc:
+            self._joined_group_ids.discard(str(group_id))
+            logger.warning("群 %s 主动发送失败，已暂停该群：%s", group_id, exc)
+            return False
+        except Exception:  # noqa: BLE001
+            logger.exception("群 %s 主动发送失败，本轮已跳过", group_id)
+            return False
 
     async def _send_group_message(
         self,

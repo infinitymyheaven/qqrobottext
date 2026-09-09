@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from src.bot import (
     BotConfig,
     DeepSeekClient,
+    OneBotActionError,
     QQBot,
     extract_mentioned_ids,
     extract_message_text,
@@ -180,6 +181,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.pending = {}
         self.ws = FakeWebSocket(self.pending)
+        self.bot._joined_group_ids.add(GROUP_ID)
 
     async def asyncTearDown(self):
         self.store.close()
@@ -267,6 +269,31 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             [item["action"] for item in ws.sent],
             ["get_group_list", "get_group_member_list"],
         )
+
+    async def test_full_sync_skips_allowlisted_group_bot_has_not_joined(self):
+        other_group = "99999"
+        self.bot.config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID, other_group}), timezone=TZ
+        )
+        responses = {
+            "get_group_list": [{"group_id": int(GROUP_ID), "group_name": "测试群"}],
+            "get_group_member_list": [],
+        }
+        ws = FakeWebSocket(self.pending, responses)
+        await self.bot._sync_all_groups(ws, self.pending)
+        member_calls = [item for item in ws.sent if item["action"] == "get_group_member_list"]
+        self.assertEqual(len(member_calls), 1)
+        self.assertEqual(member_calls[0]["params"]["group_id"], int(GROUP_ID))
+        self.assertEqual(self.bot._joined_group_ids, {GROUP_ID})
+
+    async def test_failed_scheduled_send_pauses_group_without_raising(self):
+        self.bot._send_group_message = AsyncMock(
+            side_effect=OneBotActionError(1200, "发送失败，你已被移出该群，请重新加群。")
+        )
+        await self.bot._run_scheduled_once(self.ws, self.pending)
+        self.assertNotIn(GROUP_ID, self.bot._joined_group_ids)
+        await self.bot._run_scheduled_once(self.ws, self.pending)
+        self.bot._send_group_message.assert_awaited_once()
 
     async def test_notice_debounces_and_refreshes_group(self):
         self.bot._sync_group = AsyncMock()

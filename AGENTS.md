@@ -21,6 +21,7 @@
 ## 3. 安全边界与配置
 
 - `ACTIVE_GROUP_IDS` 是英文逗号分隔的 QQ 群号白名单；为空时禁用回复、同步、问候和提醒。
+- 白名单不等于已入群：每次连接先用 `get_group_list` 验证实际在群状态，只有交集群会同步和主动发送；群消息/通知也会实时更新已入群集合。
 - 回答窗口默认 `[10:00, 19:00)`，时区 `Asia/Shanghai`；窗口外被 @ 也不回答。
 - `FUTURE_MEMORY_SOURCE=active_window_all` 默认扫描回答时段内日期候选消息；改为 `participated` 只分析机器人参与的消息。两套逻辑在 `_handle_group_message()` 有注释，README 必须保持显著说明。
 - `DEEPSEEK_API_KEY` 必填。任何真实 API Key、NapCat WebUI Token、群号白名单、数据库内容或 QQ 登录数据都不得写入文档或提交。
@@ -29,6 +30,7 @@
 ## 4. 成员资料与上下文
 
 - 连接后调用 `get_group_list` 和每个白名单群的 `get_group_member_list(no_cache=true)`；每 21600 秒重做全量同步。
+- 定时问候或提醒遇到 OneBot 动作失败时只暂停对应群，不允许异常结束调度器并触发 WebSocket 重连循环。
 - `group_increase`、`group_decrease`、`group_admin`、`group_card` 通知会延迟 2 秒刷新该群并合并重复刷新。
 - SQLite 默认 `data/bot_memory.sqlite3`：
   - `groups`：群名与最后同步时间。
