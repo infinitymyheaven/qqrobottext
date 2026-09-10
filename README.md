@@ -159,7 +159,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 
 `deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通问题由模型判断是否联网，明确要求搜索时强制联网核验。天气、新闻等实时信息和本地未来事项中没有记录的外部事件均可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
 
-DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器人会在发送前拦截这类内容，并使用版本化搜索工具、关闭思考后安全重试一次；若仍未得到标准 `web_search_call`，只发送联网失败提示，绝不会把 DSML 协议文字发到群里。
+DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器人会在发送前拦截这类内容；明确联网时使用只含搜索工具的 `tool_choice=required`，兼容重试会改用版本化搜索工具并关闭思考。标准 `web_search_call` 或服务端 URL 引用都可作为已搜索证据；若仍无证据，只发送联网失败提示，绝不会把 DSML 协议文字发到群里。
 
 默认 `DEEPSEEK_SYSTEM_PROMPT` 将机器人定义为群内平等、自然且有分寸的群友。每次 AI 回答会在事实资料之外单独注入当前激活的结构化人格内容因子；普通 Chat Completions 与联网 Responses 两条路径共用人格和对话要求。对话要求是最终硬约束，不能被 `.env` 提示词、人格、资料或聊天消息覆盖，内容因子也不得进入搜索词。
 

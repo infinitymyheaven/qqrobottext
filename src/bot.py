@@ -1013,13 +1013,15 @@ class DeepSeekClient:
         )
         input_items.append({"role": "user", "content": safe_user_text})
         # 只有用户明确要求联网/搜索时才强制工具调用；本地时间问题已在 chat() 返回。
+        # 强制时使用 required，而不是指定工具对象。工具列表只有 web_search，
+        # 因此语义相同，但可避开部分 DeepSeek V4 请求被接受却忽略指定工具的情况。
         force_search = bool(_EXPLICIT_WEB_SEARCH_PATTERN.search(user_text))
         body = {
             "model": self.model,
             "instructions": instructions,
             "input": input_items,
             "tools": [{"type": "web_search"}],
-            "tool_choice": {"type": "web_search"} if force_search else "auto",
+            "tool_choice": "required" if force_search else "auto",
             "stream": False,
             "max_output_tokens": self.max_tokens,
         }
@@ -1065,6 +1067,15 @@ class DeepSeekClient:
                     return result
 
             if attempt == 1:
+                logger.warning(
+                    "%s响应缺少可验证的联网证据：%s",
+                    operation,
+                    json.dumps(
+                        self._responses_shape_summary(payload),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
                 reason = "连续返回内部 DSML 工具标记" if leaked_dsml else "未执行被强制要求的联网搜索"
                 raise DeepSeekWebSearchError(f"{operation}{reason}")
 
@@ -1073,7 +1084,8 @@ class DeepSeekClient:
             logger.warning("%s未形成标准 web_search_call，正在进行一次兼容重试。", operation)
             request_body = dict(body)
             request_body["tools"] = [{"type": "web_search_2025_08_26"}]
-            request_body["tool_choice"] = {"type": "web_search_2025_08_26"}
+            # required 配合唯一工具，比指定工具对象在当前 V4 后端上更稳定。
+            request_body["tool_choice"] = "required"
             request_body["reasoning"] = {"effort": "none"}
             request_body["instructions"] = (
                 str(body.get("instructions") or "")
@@ -1152,7 +1164,7 @@ class DeepSeekClient:
             ),
             "input": [{"role": "user", "content": json.dumps(safe_queries, ensure_ascii=False)}],
             "tools": [{"type": "web_search"}],
-            "tool_choice": {"type": "web_search"},
+            "tool_choice": "required",
             "stream": False,
             "max_output_tokens": 4096,
         }
@@ -1429,7 +1441,39 @@ class DeepSeekClient:
         answer = "\n".join(texts).strip()
         if not answer:
             raise DeepSeekAPIError("DeepSeek Responses 返回了空回复")
+        # 有些兼容响应会遗漏 web_search_call，但 output_text 仍带有
+        # 服务端产生的 URL citation。引用注解同样是已执行联网的可验证证据。
+        used_web = used_web or bool(sources)
         return answer, used_web, sources, actions
+
+    @staticmethod
+    def _responses_shape_summary(payload: dict) -> dict:
+        """返回不含正文、查询或 URL 的 Responses 结构摘要，供故障诊断。"""
+        output_types: list[str] = []
+        content_types: list[str] = []
+        annotation_count = 0
+        output = payload.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                output_types.append(str(item.get("type") or "<missing>"))
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    content_types.append(str(part.get("type") or "<missing>"))
+                    annotations = part.get("annotations")
+                    if isinstance(annotations, list):
+                        annotation_count += len(annotations)
+        return {
+            "status": str(payload.get("status") or "<missing>"),
+            "output_types": output_types,
+            "content_types": content_types,
+            "annotation_count": annotation_count,
+        }
 
     @staticmethod
     def _contains_dsml_tool_markup(value: str) -> bool:

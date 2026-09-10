@@ -515,7 +515,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         client = DeepSeekClient("test-key")
         with patch("src.bot.urlopen", fake_urlopen):
             await client.chat([], "请联网搜索今天的天气")
-        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
+        self.assertEqual(captured["body"]["tool_choice"], "required")
 
     async def test_dsml_leak_retries_with_versioned_web_tool(self):
         bodies = []
@@ -572,12 +572,63 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             bodies[1]["tools"], [{"type": "web_search_2025_08_26"}]
         )
         self.assertEqual(
-            bodies[1]["tool_choice"], {"type": "web_search_2025_08_26"}
+            bodies[1]["tool_choice"], "required"
         )
         self.assertEqual(bodies[1]["reasoning"], {"effort": "none"})
         self.assertNotIn("DSML", answer)
         self.assertNotIn("鸣潮 最新版本", "\n".join(logs.output))
         self.assertNotIn("DSML", "\n".join(logs.output))
+
+    async def test_url_citation_is_accepted_as_web_search_evidence(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "今天天气晴。",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/weather",
+                                    "title": "天气来源",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", return_value=FakeHTTPResponse(response)):
+            answer = await client.chat([], "请联网搜索今天的天气")
+        self.assertEqual(answer, "今天天气晴。")
+
+    async def test_missing_web_evidence_logs_only_response_shape(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "私密查询和未验证答案"}
+                    ],
+                }
+            ],
+        }
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", return_value=FakeHTTPResponse(response)), self.assertLogs(
+            "qqrobot", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(DeepSeekWebSearchError, "未执行"):
+                await client.chat([], "请联网搜索私密查询")
+        joined = "\n".join(logs.output)
+        self.assertIn('"output_types":["message"]', joined)
+        self.assertIn('"content_types":["output_text"]', joined)
+        self.assertNotIn("私密查询", joined)
+        self.assertNotIn("未验证答案", joined)
 
     async def test_repeated_dsml_leak_fails_without_exposing_markup(self):
         leaked = {
@@ -641,7 +692,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         with patch("src.bot.urlopen", fake_urlopen):
             result = await client.enrich_willingness_topics(["Python 最新版本"], 1.0)
         self.assertEqual(result, {"Python 最新版本": "公开摘要"})
-        self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
+        self.assertEqual(captured["body"]["tool_choice"], "required")
         self.assertEqual(captured["body"]["max_output_tokens"], 4096)
         serialized = json.dumps(captured["body"], ensure_ascii=False)
         self.assertIn("Python 最新版本", serialized)

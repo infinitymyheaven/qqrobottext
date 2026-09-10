@@ -109,7 +109,7 @@ will_reply = random_draw < probability
 - `_run_connection()` 中读取、同步、调度、意愿刷新或意愿分析任务任一意外退出时取消其余任务并重连。
 - OneBot 动作失败使用 `OneBotActionError`；定时发送失败只暂停对应群。
 - 本地时间问题不得强制联网。联网失败或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得编造实时答案。
-- DeepSeek V4 偶发把 DSML 工具协议泄漏到 `output_text`。解析器必须在任何用户可见处理之前拒绝 DSML；首轮泄漏或强制搜索漏调时只允许一次兼容重试，改用 `web_search_2025_08_26`、强制工具并设置 Responses `reasoning.effort=none`。再次泄漏或仍未形成 `web_search_call` 时进入 `WEB_SEARCH_FAILURE_REPLY`，日志不得记录 DSML 原文或查询参数。
+- DeepSeek V4 偶发把 DSML 工具协议泄漏到 `output_text`。解析器必须在任何用户可见处理之前拒绝 DSML；明确搜索使用只含联网工具的 `tool_choice=required`。首轮泄漏或强制搜索漏调时只允许一次兼容重试，改用 `web_search_2025_08_26`并设置 Responses `reasoning.effort=none`。`web_search_call` 或 output_text 的服务端 URL 引用均可作为联网证据；再次泄漏或仍无证据时进入 `WEB_SEARCH_FAILURE_REPLY`，日志只记录不含正文的响应结构，不得记录 DSML 原文或查询参数。
 
 ## 8. 安全、测试和交付清单
 
