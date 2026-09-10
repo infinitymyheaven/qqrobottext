@@ -120,6 +120,10 @@ _QQ_NUMBER_PATTERN = re.compile(r"QQ\s*\d+", re.IGNORECASE)
 _LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
 _MARKDOWN_URL_PATTERN = re.compile(r"\[([^\]]+)\]\(https?://[^)]+\)")
 _PLAIN_URL_PATTERN = re.compile(r"https?://\S+")
+_DSML_TOOL_MARKUP_PATTERN = re.compile(
+    r"<[^>\r\n]{0,48}DSML[^>\r\n]{0,96}(?:calls|invoke|parameter)[^>]*>",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger("qqrobot")
 
@@ -700,6 +704,10 @@ class DeepSeekWebSearchError(DeepSeekAPIError):
     """联网聊天失败，调用方应使用不确定性提示而不是编造实时答案。"""
 
 
+class DeepSeekDSMLLeakError(DeepSeekAPIError):
+    """DeepSeek 把内部 DSML 工具协议泄漏进了面向用户的正文。"""
+
+
 class OneBotActionError(RuntimeError):
     """NapCat 接受了动作请求，但 OneBot 返回了失败结果。"""
 
@@ -1016,19 +1024,64 @@ class DeepSeekClient:
             "max_output_tokens": self.max_tokens,
         }
         try:
+            answer, used_web, sources, actions = await self._request_web_response(
+                body,
+                require_web=force_search,
+                operation="群聊联网回答",
+            )
+        except DeepSeekAPIError as exc:
+            raise DeepSeekWebSearchError(str(exc)) from exc
+        self._log_web_search(used_web, sources, actions)
+        return self._strip_source_links(answer) if used_web else answer
+
+    async def _request_web_response(
+        self,
+        body: dict,
+        *,
+        require_web: bool,
+        operation: str,
+    ) -> tuple[str, bool, list[dict], list[dict]]:
+        """请求 Responses API，并只针对 DSML 泄漏/强制搜索漏调安全重试一次。"""
+        request_body = body
+        for attempt in range(2):
             payload = await asyncio.to_thread(
                 self._post,
-                body,
+                request_body,
                 self.responses_endpoint,
                 self.web_search_timeout_seconds,
             )
-            answer, used_web, sources, actions = self._responses_content(payload)
-        except DeepSeekAPIError as exc:
-            raise DeepSeekWebSearchError(str(exc)) from exc
-        if force_search and not used_web:
-            raise DeepSeekWebSearchError("DeepSeek 未执行被强制要求的联网搜索")
-        self._log_web_search(used_web, sources, actions)
-        return self._strip_source_links(answer) if used_web else answer
+            leaked_dsml = False
+            try:
+                result = self._responses_content(payload)
+            except DeepSeekDSMLLeakError:
+                leaked_dsml = True
+                result = None
+
+            if result is not None:
+                _, used_web, _, _ = result
+                # auto 模式首轮允许不搜索；一旦首轮已经泄漏 DSML 并进入
+                # 兼容重试，第二轮也必须真的形成结构化 web_search_call。
+                if used_web or (not require_web and attempt == 0):
+                    return result
+
+            if attempt == 1:
+                reason = "连续返回内部 DSML 工具标记" if leaked_dsml else "未执行被强制要求的联网搜索"
+                raise DeepSeekWebSearchError(f"{operation}{reason}")
+
+            # V4 偶发把 DSML 当 output_text 返回。重试改用版本化工具名、
+            # 强制搜索并关闭思考，减少再次生成协议正文的概率。
+            logger.warning("%s未形成标准 web_search_call，正在进行一次兼容重试。", operation)
+            request_body = dict(body)
+            request_body["tools"] = [{"type": "web_search_2025_08_26"}]
+            request_body["tool_choice"] = {"type": "web_search_2025_08_26"}
+            request_body["reasoning"] = {"effort": "none"}
+            request_body["instructions"] = (
+                str(body.get("instructions") or "")
+                + "\n必须由服务端执行 web_search；不要在 output_text 中输出 DSML、"
+                "tool_calls、invoke 或 parameter 等内部工具协议。搜索完成后只输出最终正文。"
+            )
+
+        raise DeepSeekWebSearchError(f"{operation}兼容重试异常结束")
 
     async def extract_future_events(self, text: str, now: datetime) -> list[dict]:
         prompt = (
@@ -1103,12 +1156,11 @@ class DeepSeekClient:
             "stream": False,
             "max_output_tokens": 4096,
         }
-        payload = await asyncio.to_thread(
-            self._post, body, self.responses_endpoint, self.web_search_timeout_seconds
+        content, used_web, sources, actions = await self._request_web_response(
+            body,
+            require_web=True,
+            operation="话题知识丰富",
         )
-        content, used_web, sources, actions = self._responses_content(payload)
-        if not used_web:
-            raise DeepSeekWebSearchError("话题知识丰富未执行联网搜索")
         self._log_web_search(used_web, sources, actions)
         try:
             decoded = json.loads(self._strip_code_fence(content))
@@ -1357,6 +1409,12 @@ class DeepSeekClient:
                     continue
                 value = part.get("text")
                 if isinstance(value, str) and value.strip():
+                    if DeepSeekClient._contains_dsml_tool_markup(value):
+                        # 不解析、执行或记录模型泄漏的工具参数，避免把内部协议
+                        # 以及潜在的私密搜索词发到 QQ 或错误现场日志。
+                        raise DeepSeekDSMLLeakError(
+                            "DeepSeek Responses 将内部 DSML 工具调用作为正文返回"
+                        )
                     texts.append(value.strip())
                 for annotation in part.get("annotations") or []:
                     if not isinstance(annotation, dict):
@@ -1372,6 +1430,10 @@ class DeepSeekClient:
         if not answer:
             raise DeepSeekAPIError("DeepSeek Responses 返回了空回复")
         return answer, used_web, sources, actions
+
+    @staticmethod
+    def _contains_dsml_tool_markup(value: str) -> bool:
+        return bool(_DSML_TOOL_MARKUP_PATTERN.search(unescape(value)))
 
     def _log_web_search(
         self, used_web: bool, sources: list[dict], actions: list[dict]

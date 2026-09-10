@@ -517,6 +517,95 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             await client.chat([], "请联网搜索今天的天气")
         self.assertEqual(captured["body"]["tool_choice"], {"type": "web_search"})
 
+    async def test_dsml_leak_retries_with_versioned_web_tool(self):
+        bodies = []
+        responses = iter(
+            [
+                {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": (
+                                        '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="web_search">'
+                                        '<｜｜DSML｜｜ parameter name="query" string="true">'
+                                        '鸣潮 最新版本</｜｜DSML｜｜ parameter>'
+                                        '</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>'
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {
+                    "status": "completed",
+                    "output": [
+                        {"type": "web_search_call", "action": {"type": "search"}},
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "鸣潮最新版本是3.5。"}
+                            ],
+                        },
+                    ],
+                },
+            ]
+        )
+
+        def fake_urlopen(request, timeout):
+            bodies.append(json.loads(request.data.decode("utf-8")))
+            return FakeHTTPResponse(next(responses))
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen), self.assertLogs(
+            "qqrobot", level="WARNING"
+        ) as logs:
+            answer = await client.chat([], "请联网搜索鸣潮最新版本")
+
+        self.assertEqual(answer, "鸣潮最新版本是3.5。")
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0]["tools"], [{"type": "web_search"}])
+        self.assertEqual(
+            bodies[1]["tools"], [{"type": "web_search_2025_08_26"}]
+        )
+        self.assertEqual(
+            bodies[1]["tool_choice"], {"type": "web_search_2025_08_26"}
+        )
+        self.assertEqual(bodies[1]["reasoning"], {"effort": "none"})
+        self.assertNotIn("DSML", answer)
+        self.assertNotIn("鸣潮 最新版本", "\n".join(logs.output))
+        self.assertNotIn("DSML", "\n".join(logs.output))
+
+    async def test_repeated_dsml_leak_fails_without_exposing_markup(self):
+        leaked = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": (
+                                '<|DSML|tool_calls><|DSML|invoke name="web_search">'
+                                '<|DSML|parameter name="query">天气</|DSML|parameter>'
+                                '</|DSML|invoke></|DSML|tool_calls>'
+                            ),
+                        }
+                    ],
+                }
+            ],
+        }
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", return_value=FakeHTTPResponse(leaked)), self.assertLogs(
+            "qqrobot", level="WARNING"
+        ) as logs:
+            with self.assertRaisesRegex(DeepSeekWebSearchError, "连续返回内部 DSML"):
+                await client.chat([], "天气怎么样")
+        self.assertNotIn("DSML", "\n".join(logs.output))
+
     async def test_extract_future_event_json(self):
         response = {
             "choices": [

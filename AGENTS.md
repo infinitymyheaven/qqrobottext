@@ -109,6 +109,7 @@ will_reply = random_draw < probability
 - `_run_connection()` 中读取、同步、调度、意愿刷新或意愿分析任务任一意外退出时取消其余任务并重连。
 - OneBot 动作失败使用 `OneBotActionError`；定时发送失败只暂停对应群。
 - 本地时间问题不得强制联网。联网失败或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得编造实时答案。
+- DeepSeek V4 偶发把 DSML 工具协议泄漏到 `output_text`。解析器必须在任何用户可见处理之前拒绝 DSML；首轮泄漏或强制搜索漏调时只允许一次兼容重试，改用 `web_search_2025_08_26`、强制工具并设置 Responses `reasoning.effort=none`。再次泄漏或仍未形成 `web_search_call` 时进入 `WEB_SEARCH_FAILURE_REPLY`，日志不得记录 DSML 原文或查询参数。
 
 ## 8. 安全、测试和交付清单
 
@@ -116,6 +117,7 @@ will_reply = random_draw < probability
 - `.env`、`data/`、`logs/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore`。
 - 配置新增/改名同步 `.env.example`、README、`BotConfig.from_env()` 严格校验和测试。
 - 数据库变化必须有旧 schema 无损迁移测试。
+- 联网测试必须覆盖全角/ASCII DSML 泄漏、一次兼容重试、连续泄漏安全失败，并断言协议原文不会进入最终答案或常规日志。
 - 修改后至少运行：完整单元测试、`py_compile`、`git diff --check`、Git 状态、跟踪/暂存文件敏感值扫描。
 - 提交或推送前再次 `git fetch origin`，确认目标分支和远端没有未知提交。只有用户明确要求时才提交、推送或跨分支同步。
 - 远端仓库：`https://github.com/infinitymyheaven/qqrobottext`。
