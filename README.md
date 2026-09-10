@@ -168,7 +168,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 模型名称 |
 | `DEEPSEEK_SYSTEM_PROMPT` | 中文群聊助手提示词 | 机器人角色设定 |
 | `DEEPSEEK_TIMEOUT_SECONDS` | `60` | 单次 DeepSeek 请求超时 |
-| `DEEPSEEK_MAX_TOKENS` | `1024` | 聊天回复最大生成 token 数 |
+| `DEEPSEEK_MAX_TOKENS` | `4096` | 聊天回复最大生成 token 数 |
 | `WEB_SEARCH_ENABLED` | `true` | 是否让群聊回答使用 Responses API 和服务端联网搜索 |
 | `WEB_SEARCH_TIMEOUT_SECONDS` | `90` | 联网回答请求超时；必须大于 0 |
 | `WEB_SEARCH_FAILURE_REPLY` | `我不知道，暂时没有查到可靠的联网信息。` | 联网失败、不完整或无法核验时的群内提示 |

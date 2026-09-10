@@ -386,7 +386,7 @@ class BotConfig:
     web_search_failure_reply: str = DEFAULT_WEB_SEARCH_FAILURE_REPLY
     empty_reply: str = DEFAULT_EMPTY_REPLY
     deepseek_timeout_seconds: float = 60.0
-    deepseek_max_tokens: int = 1024
+    deepseek_max_tokens: int = 4096
     web_search_enabled: bool = True
     web_search_timeout_seconds: float = 90.0
     web_search_log_sources: bool = True
@@ -624,7 +624,7 @@ class BotConfig:
             deepseek_timeout_seconds=_env_float(
                 "DEEPSEEK_TIMEOUT_SECONDS", 60.0, minimum=0.1
             ),
-            deepseek_max_tokens=_env_int("DEEPSEEK_MAX_TOKENS", 1024, minimum=1),
+            deepseek_max_tokens=_env_int("DEEPSEEK_MAX_TOKENS", 4096, minimum=1),
             web_search_enabled=_env_bool("WEB_SEARCH_ENABLED", True),
             web_search_timeout_seconds=_env_float(
                 "WEB_SEARCH_TIMEOUT_SECONDS", 90.0, minimum=0.1
@@ -726,7 +726,7 @@ class DeepSeekClient:
         model: str = DEFAULT_DEEPSEEK_MODEL,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         timeout_seconds: float = 60.0,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         web_search_enabled: bool = True,
         web_search_timeout_seconds: float = 90.0,
         web_search_log_sources: bool = True,
@@ -981,7 +981,7 @@ class DeepSeekClient:
             "tools": [{"type": "web_search"}],
             "tool_choice": {"type": "web_search"},
             "stream": False,
-            "max_output_tokens": 1536,
+            "max_output_tokens": 4096,
         }
         payload = await asyncio.to_thread(
             self._post, body, self.responses_endpoint, self.web_search_timeout_seconds
