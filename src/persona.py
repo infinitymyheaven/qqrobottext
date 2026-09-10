@@ -27,25 +27,39 @@ class ContentFactor:
     version: int
     confidence: float
     guidance: str
+    # style 是人格等软偏好；constraint 是不可被其他因子覆盖的硬边界。
+    # 默认值保证旧调用方继续使用四个位置参数而无需迁移。
+    kind: str = "style"
+    priority: int = 0
 
     def render(self, max_chars: int = 6000) -> str:
         """生成有明确边界的系统指导块，避免把画像误当作事实或指令来源。"""
         guidance = "\n".join(
             " ".join(line.split()) for line in str(self.guidance).splitlines() if line.strip()
         )[:max_chars]
+        label = "硬约束" if self.kind == "constraint" else "内容因子"
         return (
-            f"[内容因子:{self.name};版本:{self.version};置信度:{self.confidence:.2f}]\n"
-            f"{guidance}\n[/内容因子:{self.name}]"
+            f"[{label}:{self.name};版本:{self.version};置信度:{self.confidence:.2f}]\n"
+            f"{guidance}\n[/{label}:{self.name}]"
         )
 
 
 def render_content_factors(
     factors: Sequence[ContentFactor], *, max_total_chars: int = 8000
 ) -> str:
-    """按传入顺序拼接内容因子，并设置总长度上限防止挤占聊天上下文。"""
+    """硬约束优先拼接内容因子，并设置总长度上限防止挤占聊天上下文。"""
     rendered: list[str] = []
     remaining = max_total_chars
-    for factor in factors:
+    # 约束优先且按 priority 降序，确保软人格再长也不能挤掉基础边界。
+    ordered = sorted(
+        enumerate(factors),
+        key=lambda item: (
+            0 if item[1].kind == "constraint" else 1,
+            -int(item[1].priority),
+            item[0],
+        ),
+    )
+    for _index, factor in ordered:
         if remaining <= 0:
             break
         block = factor.render(min(6000, max(0, remaining - 100)))[:remaining]
