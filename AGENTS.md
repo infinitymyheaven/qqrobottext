@@ -4,7 +4,7 @@
 
 - 项目名 `qqrobottext`，Python 3.10+。NapCat OneBot v11 正向 WebSocket 接收 QQ 群事件，本项目负责状态、意愿决策和调度，DeepSeek 负责聊天、低频知识提炼及联网搜索。
 - 当前主分支已经把回复意愿拆到 `src/reply_willingness.py`；`src/bot.py` 不应再次出现一套平行概率公式。
-- 群聊回答在 `WEB_SEARCH_ENABLED=true` 时使用 Responses API；普通请求 `tool_choice=auto`，只有明确联网请求才强制 `web_search`。本地时间问题直接用传入的带时区时钟回答。
+- 群聊回答在 `WEB_SEARCH_ENABLED=true` 时优先使用 Responses API；普通稳定知识请求使用 `tool_choice=auto`，明确联网或天气、新闻、最新版本、行情、比分、非本地时间等明显实时问题强制 `web_search`。Responses 连续缺少联网证据时，默认使用同一 Key 切换 DeepSeek Anthropic `/messages` 的 `web_search_20250305`；本地时间问题直接用传入的带时区时钟回答。
 - 群聊 Chat Completions/Responses 的默认输出上限由 `DEEPSEEK_MAX_TOKENS=4096` 控制；话题联网丰富当前也使用 `max_output_tokens=4096`，避免搜索和思考 token 挤占最终 JSON。未来事项、人格和话题本地提取仍使用各自的结构化 JSON 额度与安全重试，不要误绑到聊天额度。
 - 自动测试使用临时 SQLite、模拟 WebSocket 和模拟 DeepSeek，绝不连接真实 QQ 或消耗 API 额度。
 - 开始工作前先执行 `git fetch origin` 并检查当前分支、远端头和工作区，不要假定提交状态。
@@ -109,7 +109,7 @@ will_reply = random_draw < probability
 - `_run_connection()` 中读取、同步、调度、意愿刷新或意愿分析任务任一意外退出时取消其余任务并重连。
 - OneBot 动作失败使用 `OneBotActionError`；定时发送失败只暂停对应群。
 - 本地时间问题不得强制联网。联网失败或强制搜索未执行时发送 `WEB_SEARCH_FAILURE_REPLY`，不得编造实时答案。
-- DeepSeek V4 偶发把 DSML 工具协议泄漏到 `output_text`。解析器必须在任何用户可见处理之前拒绝 DSML；明确搜索使用只含联网工具的 `tool_choice=required`。首轮泄漏或强制搜索漏调时只允许一次兼容重试，改用 `web_search_2025_08_26`并设置 Responses `reasoning.effort=none`。`web_search_call` 或 output_text 的服务端 URL 引用均可作为联网证据；再次泄漏或仍无证据时进入 `WEB_SEARCH_FAILURE_REPLY`，日志只记录不含正文的响应结构，不得记录 DSML 原文或查询参数。
+- DeepSeek V4 偶发把 DSML 工具协议泄漏到 `output_text`。解析器必须在任何用户可见处理之前拒绝 DSML；明确搜索使用只含联网工具的 `tool_choice=required`。首轮泄漏或强制搜索漏调时只允许一次 Responses 兼容重试，仍无证据时按配置切换 DeepSeek Anthropic 服务端搜索。Responses `web_search_call`/URL 引用和 Anthropic `server_tool_use`/`web_search_tool_result`/usage 均可作为联网证据。两条路径均不得记录 DSML 原文或查询参数，最终失败时才进入 `WEB_SEARCH_FAILURE_REPLY`。
 
 ## 8. 安全、测试和交付清单
 
@@ -117,7 +117,7 @@ will_reply = random_draw < probability
 - `.env`、`data/`、`logs/`、`qq/`、`.venv/`、`.venv-virtualized-old/` 必须保持在 `.gitignore`。
 - 配置新增/改名同步 `.env.example`、README、`BotConfig.from_env()` 严格校验和测试。
 - 数据库变化必须有旧 schema 无损迁移测试。
-- 联网测试必须覆盖全角/ASCII DSML 泄漏、一次兼容重试、连续泄漏安全失败，并断言协议原文不会进入最终答案或常规日志。
+- 联网测试必须覆盖全角/ASCII DSML 泄漏、Responses 兼容重试、Anthropic 自动回退、搜索证据解析和最终安全失败，并断言协议原文不会进入最终答案或常规日志。
 - 修改后至少运行：完整单元测试、`py_compile`、`git diff --check`、Git 状态、跟踪/暂存文件敏感值扫描。
 - 提交或推送前再次 `git fetch origin`，确认目标分支和远端没有未知提交。只有用户明确要求时才提交、推送或跨分支同步。
 - 远端仓库：`https://github.com/infinitymyheaven/qqrobottext`。

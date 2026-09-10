@@ -109,6 +109,11 @@ _EXPLICIT_WEB_SEARCH_PATTERN = re.compile(
     r"(?:联网|上网|网络)(?:搜索|查找|查询|查一下|搜一下)|"
     r"(?:搜索|查找|查询|查一下|搜一下)(?:网络|网上|一下)?"
 )
+_REALTIME_WEB_SEARCH_PATTERN = re.compile(
+    r"天气|气温|降雨|空气质量|新闻|热搜|最新|实时|"
+    r"现价|股价|汇率|行情|赛事比分|比赛结果|"
+    r"几点(?:钟)?|当前时间|现在.{0,12}时间|时间.{0,8}多少"
+)
 _LOCAL_TIME_QUESTION_PATTERN = re.compile(
     r"^\s*(?:(?:请问|你知道|告诉我|机器人)[，,：:\s]*)?"
     r"(?:(?:现在|当前|此刻|当地|北京)(?:是)?"
@@ -395,6 +400,8 @@ class BotConfig:
     deepseek_max_tokens: int = 4096
     web_search_enabled: bool = True
     web_search_timeout_seconds: float = 90.0
+    web_search_anthropic_fallback_enabled: bool = True
+    web_search_max_uses: int = 3
     web_search_log_sources: bool = True
     web_search_max_log_sources: int = 5
     error_log_enabled: bool = True
@@ -635,6 +642,10 @@ class BotConfig:
             web_search_timeout_seconds=_env_float(
                 "WEB_SEARCH_TIMEOUT_SECONDS", 90.0, minimum=0.1
             ),
+            web_search_anthropic_fallback_enabled=_env_bool(
+                "WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED", True
+            ),
+            web_search_max_uses=_env_int("WEB_SEARCH_MAX_USES", 3, minimum=1, maximum=10),
             web_search_log_sources=_env_bool("WEB_SEARCH_LOG_SOURCES", True),
             web_search_max_log_sources=_env_int(
                 "WEB_SEARCH_MAX_LOG_SOURCES", 5, minimum=0
@@ -739,6 +750,8 @@ class DeepSeekClient:
         max_tokens: int = 4096,
         web_search_enabled: bool = True,
         web_search_timeout_seconds: float = 90.0,
+        web_search_anthropic_fallback_enabled: bool = True,
+        web_search_max_uses: int = 3,
         web_search_log_sources: bool = True,
         web_search_max_log_sources: int = 5,
         conversation_requirements: ConversationRequirements | None = None,
@@ -751,6 +764,8 @@ class DeepSeekClient:
         self.max_tokens = max_tokens
         self.web_search_enabled = web_search_enabled
         self.web_search_timeout_seconds = web_search_timeout_seconds
+        self.web_search_anthropic_fallback_enabled = web_search_anthropic_fallback_enabled
+        self.web_search_max_uses = web_search_max_uses
         self.web_search_log_sources = web_search_log_sources
         self.web_search_max_log_sources = web_search_max_log_sources
         # 第二内容指标是内置硬边界，不提供环境变量关闭开关。
@@ -772,6 +787,11 @@ class DeepSeekClient:
     @property
     def responses_endpoint(self) -> str:
         return f"{self.api_root}/responses"
+
+    @property
+    def anthropic_messages_endpoint(self) -> str:
+        root = self.api_root[:-3] if self.api_root.endswith("/v1") else self.api_root
+        return f"{root}/anthropic/v1/messages"
 
     async def chat(
         self,
@@ -1015,7 +1035,10 @@ class DeepSeekClient:
         # 只有用户明确要求联网/搜索时才强制工具调用；本地时间问题已在 chat() 返回。
         # 强制时使用 required，而不是指定工具对象。工具列表只有 web_search，
         # 因此语义相同，但可避开部分 DeepSeek V4 请求被接受却忽略指定工具的情况。
-        force_search = bool(_EXPLICIT_WEB_SEARCH_PATTERN.search(user_text))
+        force_search = bool(
+            _EXPLICIT_WEB_SEARCH_PATTERN.search(user_text)
+            or _REALTIME_WEB_SEARCH_PATTERN.search(user_text)
+        )
         body = {
             "model": self.model,
             "instructions": instructions,
@@ -1043,20 +1066,29 @@ class DeepSeekClient:
         require_web: bool,
         operation: str,
     ) -> tuple[str, bool, list[dict], list[dict]]:
-        """请求 Responses API，并只针对 DSML 泄漏/强制搜索漏调安全重试一次。"""
+        """Responses 失去联网证据时，改用同一 DeepSeek Key 的 Anthropic 协议。"""
         request_body = body
+        failure_reason = "未执行被强制要求的联网搜索"
         for attempt in range(2):
-            payload = await asyncio.to_thread(
-                self._post,
-                request_body,
-                self.responses_endpoint,
-                self.web_search_timeout_seconds,
-            )
+            try:
+                payload = await asyncio.to_thread(
+                    self._post,
+                    request_body,
+                    self.responses_endpoint,
+                    self.web_search_timeout_seconds,
+                )
+            except DeepSeekAPIError as exc:
+                failure_reason = f"Responses 请求失败：{exc}"
+                break
             leaked_dsml = False
             try:
                 result = self._responses_content(payload)
             except DeepSeekDSMLLeakError:
                 leaked_dsml = True
+                failure_reason = "连续返回内部 DSML 工具标记"
+                result = None
+            except DeepSeekAPIError as exc:
+                failure_reason = str(exc)
                 result = None
 
             if result is not None:
@@ -1065,6 +1097,7 @@ class DeepSeekClient:
                 # 兼容重试，第二轮也必须真的形成结构化 web_search_call。
                 if used_web or (not require_web and attempt == 0):
                     return result
+                failure_reason = "未执行被强制要求的联网搜索"
 
             if attempt == 1:
                 logger.warning(
@@ -1076,8 +1109,7 @@ class DeepSeekClient:
                         separators=(",", ":"),
                     ),
                 )
-                reason = "连续返回内部 DSML 工具标记" if leaked_dsml else "未执行被强制要求的联网搜索"
-                raise DeepSeekWebSearchError(f"{operation}{reason}")
+                break
 
             # V4 偶发把 DSML 当 output_text 返回。重试改用版本化工具名、
             # 强制搜索并关闭思考，减少再次生成协议正文的概率。
@@ -1093,7 +1125,91 @@ class DeepSeekClient:
                 "tool_calls、invoke 或 parameter 等内部工具协议。搜索完成后只输出最终正文。"
             )
 
-        raise DeepSeekWebSearchError(f"{operation}兼容重试异常结束")
+        if not self.web_search_anthropic_fallback_enabled:
+            raise DeepSeekWebSearchError(f"{operation}{failure_reason}")
+        logger.warning(
+            "%s Responses 服务端未执行联网，切换到 DeepSeek Anthropic 协议重试。",
+            operation,
+        )
+        try:
+            return await self._request_anthropic_web_response(body, operation=operation)
+        except DeepSeekAPIError as exc:
+            raise DeepSeekWebSearchError(f"{operation} Anthropic 联网回退失败：{exc}") from exc
+
+    async def _request_anthropic_web_response(
+        self,
+        responses_body: dict,
+        *,
+        operation: str,
+    ) -> tuple[str, bool, list[dict], list[dict]]:
+        """使用 DeepSeek 兼容的 Anthropic Messages 协议执行服务端搜索。"""
+        system_parts = [str(responses_body.get("instructions") or "")]
+        messages: list[dict] = []
+        for item in responses_body.get("input") or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = item.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+            elif role in {"user", "assistant"}:
+                messages.append({"role": role, "content": content})
+        if not messages:
+            raise DeepSeekAPIError("Anthropic 联网请求缺少用户消息")
+
+        request_body = {
+            "model": str(responses_body.get("model") or self.model),
+            "max_tokens": int(responses_body.get("max_output_tokens") or self.max_tokens),
+            "system": "\n".join(part for part in system_parts if part),
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": self.web_search_max_uses,
+                }
+            ],
+            # any 配合唯一的 web_search 工具，强制服务端搜索。
+            "tool_choice": {"type": "any"},
+        }
+        all_sources: list[dict] = []
+        all_actions: list[dict] = []
+        used_web = False
+        for _ in range(3):
+            payload = await asyncio.to_thread(
+                self._post_anthropic,
+                request_body,
+                self.anthropic_messages_endpoint,
+                self.web_search_timeout_seconds,
+            )
+            answer, turn_used_web, sources, actions = self._anthropic_content(
+                payload,
+                allow_empty=payload.get("stop_reason") == "pause_turn",
+            )
+            used_web = used_web or turn_used_web
+            all_sources.extend(sources)
+            all_actions.extend(actions)
+            if payload.get("stop_reason") != "pause_turn":
+                if not used_web:
+                    raise DeepSeekAPIError("Anthropic 响应未执行 web_search")
+                if not answer:
+                    raise DeepSeekAPIError("Anthropic 联网响应没有最终正文")
+                logger.info("%s已通过 DeepSeek Anthropic 协议完成联网。", operation)
+                return answer, True, all_sources, all_actions
+
+            content = payload.get("content")
+            if not isinstance(content, list):
+                raise DeepSeekAPIError("Anthropic pause_turn 缺少可续传的 content")
+            request_body = dict(request_body)
+            request_body["messages"] = [
+                *request_body["messages"],
+                {"role": "assistant", "content": content},
+            ]
+            # 续传时让服务端完成已开始的搜索，不再强制新建调用。
+            request_body["tool_choice"] = {"type": "auto"}
+        raise DeepSeekAPIError("Anthropic 联网连续 pause_turn，超过安全续传上限")
 
     async def extract_future_events(self, text: str, now: datetime) -> list[dict]:
         prompt = (
@@ -1378,6 +1494,30 @@ class DeepSeekClient:
             raise DeepSeekAPIError("DeepSeek 返回了无法识别的数据")
         return payload
 
+    def _post_anthropic(self, body: dict, endpoint: str, timeout_seconds: float) -> dict:
+        request = Request(
+            endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            # Anthropic 兼容错误可能回显请求信息，日志只保留状态码。
+            exc.read()
+            raise DeepSeekAPIError(f"DeepSeek Anthropic HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise DeepSeekAPIError(f"DeepSeek Anthropic 请求失败：{type(exc).__name__}") from exc
+        if not isinstance(payload, dict):
+            raise DeepSeekAPIError("DeepSeek Anthropic 返回了无法识别的数据")
+        return payload
+
     @staticmethod
     def _sanitize_web_context(context: str) -> str:
         without_qq = _QQ_NUMBER_PATTERN.sub("QQ号已隐藏", context)
@@ -1445,6 +1585,80 @@ class DeepSeekClient:
         # 服务端产生的 URL citation。引用注解同样是已执行联网的可验证证据。
         used_web = used_web or bool(sources)
         return answer, used_web, sources, actions
+
+    @staticmethod
+    def _anthropic_content(
+        payload: dict,
+        *,
+        allow_empty: bool = False,
+    ) -> tuple[str, bool, list[dict], list[dict]]:
+        stop_reason = payload.get("stop_reason")
+        if stop_reason not in {"end_turn", "pause_turn"}:
+            raise DeepSeekAPIError(
+                f"DeepSeek Anthropic 未正常完成：stop_reason={stop_reason or '<missing>'}"
+            )
+        content = payload.get("content")
+        if not isinstance(content, list):
+            raise DeepSeekAPIError("DeepSeek Anthropic 返回了无法识别的 content")
+
+        texts: list[str] = []
+        sources: list[dict] = []
+        actions: list[dict] = []
+        used_web = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "server_tool_use" and block.get("name") == "web_search":
+                used_web = True
+                actions.append({"type": "search"})
+                continue
+            if block_type == "web_search_tool_result":
+                used_web = True
+                results = block.get("content")
+                if isinstance(results, list):
+                    for result in results:
+                        if not isinstance(result, dict) or result.get("type") != "web_search_result":
+                            continue
+                        url = result.get("url")
+                        if isinstance(url, str) and url.startswith(("http://", "https://")):
+                            sources.append(
+                                {
+                                    "title": str(result.get("title") or "未命名来源"),
+                                    "url": url,
+                                }
+                            )
+                continue
+            if block_type != "text":
+                # thinking 及其他内部块不进入用户可见回答。
+                continue
+            value = block.get("text")
+            if isinstance(value, str) and value.strip():
+                if DeepSeekClient._contains_dsml_tool_markup(value):
+                    raise DeepSeekDSMLLeakError(
+                        "DeepSeek Anthropic 将内部 DSML 工具调用作为正文返回"
+                    )
+                texts.append(value.strip())
+            for citation in block.get("citations") or []:
+                if not isinstance(citation, dict):
+                    continue
+                url = citation.get("url")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    sources.append(
+                        {
+                            "title": str(citation.get("title") or "未命名来源"),
+                            "url": url,
+                        }
+                    )
+
+        usage = payload.get("usage")
+        server_usage = usage.get("server_tool_use") if isinstance(usage, dict) else None
+        if isinstance(server_usage, dict) and int(server_usage.get("web_search_requests") or 0) > 0:
+            used_web = True
+        answer = "\n".join(texts).strip()
+        if not answer and not allow_empty:
+            raise DeepSeekAPIError("DeepSeek Anthropic 返回了空回复")
+        return answer, used_web or bool(sources), sources, actions
 
     @staticmethod
     def _responses_shape_summary(payload: dict) -> dict:
@@ -1607,7 +1821,8 @@ class QQBot:
         )
         logger.info(
             "配置已加载：工作时段 %s-%s，意愿回复%s（每群每日上限 %s），"
-            "群聊上下文 %s 秒/%s 条，对话%s，未来记忆%s，联网搜索%s，人格内容%s",
+            "群聊上下文 %s 秒/%s 条，对话%s，未来记忆%s，联网搜索%s，"
+            "Anthropic 回退%s（最多 %s 次搜索），人格内容%s",
             _format_time(self.config.answer_start_minutes),
             _format_time(self.config.answer_end_minutes),
             "启用" if self.config.spontaneous_replies_enabled else "禁用",
@@ -1617,6 +1832,8 @@ class QQBot:
             history_ttl,
             "启用" if self.config.future_memory_enabled else "禁用",
             "启用" if self.config.web_search_enabled else "禁用",
+            "启用" if self.config.web_search_anthropic_fallback_enabled else "禁用",
+            self.config.web_search_max_uses,
             "启用" if self.config.persona_content_enabled else "禁用",
         )
         logger.info("正在连接 NapCat（%s）...", self.log_url)
@@ -2524,6 +2741,10 @@ def main() -> int:
         max_tokens=config.deepseek_max_tokens,
         web_search_enabled=config.web_search_enabled,
         web_search_timeout_seconds=config.web_search_timeout_seconds,
+        web_search_anthropic_fallback_enabled=(
+            config.web_search_anthropic_fallback_enabled
+        ),
+        web_search_max_uses=config.web_search_max_uses,
         web_search_log_sources=config.web_search_log_sources,
         web_search_max_log_sources=config.web_search_max_log_sources,
     )

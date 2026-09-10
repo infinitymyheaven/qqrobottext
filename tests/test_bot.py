@@ -16,6 +16,7 @@ from src.bot import (
     BotConfig,
     ConfigError,
     DeepSeekClient,
+    DeepSeekDSMLLeakError,
     DeepSeekWebSearchError,
     OneBotActionError,
     QQBot,
@@ -473,6 +474,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         response = {
             "status": "completed",
             "output": [
+                {"type": "web_search_call", "action": {"type": "search"}},
                 {"type": "message", "content": [{"type": "output_text", "text": "外地时间"}]}
             ],
         }
@@ -485,10 +487,32 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         with patch("src.bot.urlopen", fake_urlopen):
             answer = await client.chat([], "纽约现在几点？", now=at_time(12, 30))
         self.assertEqual(answer, "外地时间")
-        self.assertEqual(captured["body"]["tool_choice"], "auto")
+        self.assertEqual(captured["body"]["tool_choice"], "required")
+
+    async def test_realtime_question_forces_web_without_explicit_search_word(self):
+        response = {
+            "status": "completed",
+            "output": [
+                {"type": "web_search_call", "action": {"type": "search"}},
+                {"type": "message", "content": [{"type": "output_text", "text": "已联网"}]},
+            ],
+        }
+        bodies = []
+
+        def fake_urlopen(request, timeout):
+            bodies.append(json.loads(request.data.decode("utf-8")))
+            return FakeHTTPResponse(response)
+
+        client = DeepSeekClient("test-key")
+        with patch("src.bot.urlopen", fake_urlopen):
+            await client.chat([], "北京今天天气怎么样？")
+            await client.chat([], "鸣潮最新版本是什么？")
+        self.assertEqual([body["tool_choice"] for body in bodies], ["required", "required"])
 
     async def test_incomplete_web_response_is_an_error(self):
-        client = DeepSeekClient("test-key")
+        client = DeepSeekClient(
+            "test-key", web_search_anthropic_fallback_enabled=False
+        )
         response = {
             "status": "incomplete",
             "incomplete_details": {"reason": "max_output_tokens"},
@@ -559,7 +583,9 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             bodies.append(json.loads(request.data.decode("utf-8")))
             return FakeHTTPResponse(next(responses))
 
-        client = DeepSeekClient("test-key")
+        client = DeepSeekClient(
+            "test-key", web_search_anthropic_fallback_enabled=False
+        )
         with patch("src.bot.urlopen", fake_urlopen), self.assertLogs(
             "qqrobot", level="WARNING"
         ) as logs:
@@ -601,7 +627,9 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
-        client = DeepSeekClient("test-key")
+        client = DeepSeekClient(
+            "test-key", web_search_anthropic_fallback_enabled=False
+        )
         with patch("src.bot.urlopen", return_value=FakeHTTPResponse(response)):
             answer = await client.chat([], "请联网搜索今天的天气")
         self.assertEqual(answer, "今天天气晴。")
@@ -618,7 +646,9 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
-        client = DeepSeekClient("test-key")
+        client = DeepSeekClient(
+            "test-key", web_search_anthropic_fallback_enabled=False
+        )
         with patch("src.bot.urlopen", return_value=FakeHTTPResponse(response)), self.assertLogs(
             "qqrobot", level="WARNING"
         ) as logs:
@@ -649,13 +679,158 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
-        client = DeepSeekClient("test-key")
+        client = DeepSeekClient(
+            "test-key", web_search_anthropic_fallback_enabled=False
+        )
         with patch("src.bot.urlopen", return_value=FakeHTTPResponse(leaked)), self.assertLogs(
             "qqrobot", level="WARNING"
         ) as logs:
             with self.assertRaisesRegex(DeepSeekWebSearchError, "连续返回内部 DSML"):
                 await client.chat([], "天气怎么样")
         self.assertNotIn("DSML", "\n".join(logs.output))
+
+    async def test_responses_without_web_falls_back_to_anthropic_search(self):
+        response_without_web = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "未验证文本"}],
+                }
+            ],
+        }
+        anthropic_response = {
+            "type": "message",
+            "stop_reason": "end_turn",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {"query": "私密搜索词"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "title": "可靠来源",
+                            "url": "https://example.com/result",
+                            "encrypted_content": "opaque",
+                        }
+                    ],
+                },
+                {
+                    "type": "text",
+                    "text": "这是联网后的答案。",
+                    "citations": [
+                        {
+                            "type": "web_search_result_location",
+                            "title": "可靠来源",
+                            "url": "https://example.com/result",
+                        }
+                    ],
+                },
+            ],
+            "usage": {"server_tool_use": {"web_search_requests": 1}},
+        }
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(
+                (request.full_url, json.loads(request.data.decode("utf-8")), timeout)
+            )
+            if request.full_url.endswith("/responses"):
+                return FakeHTTPResponse(response_without_web)
+            return FakeHTTPResponse(anthropic_response)
+
+        client = DeepSeekClient("test-key", web_search_max_uses=4)
+        with patch("src.bot.urlopen", fake_urlopen), self.assertLogs(
+            "qqrobot", level="INFO"
+        ) as logs:
+            answer = await client.chat(
+                [],
+                "请联网搜索北京天气",
+                context="群成员 QQ 123456789",
+            )
+
+        self.assertEqual(answer, "这是联网后的答案。")
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(requests[2][0].endswith("/anthropic/v1/messages"))
+        anthropic_body = requests[2][1]
+        self.assertEqual(
+            anthropic_body["tools"],
+            [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
+        )
+        self.assertEqual(anthropic_body["tool_choice"], {"type": "any"})
+        self.assertNotIn("123456789", json.dumps(anthropic_body, ensure_ascii=False))
+        joined = "\n".join(logs.output)
+        self.assertIn("Anthropic 协议完成联网", joined)
+        self.assertNotIn("私密搜索词", joined)
+
+    def test_anthropic_parser_rejects_dsml_text(self):
+        payload = {
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "server_tool_use", "name": "web_search", "input": {}},
+                {
+                    "type": "text",
+                    "text": '<|DSML|invoke name="web_search">不应发送</|DSML|invoke>',
+                },
+            ],
+        }
+        with self.assertRaises(DeepSeekDSMLLeakError):
+            DeepSeekClient._anthropic_content(payload)
+
+    async def test_anthropic_pause_turn_is_continued_without_forcing_new_search(self):
+        payloads = iter(
+            [
+                {
+                    "stop_reason": "pause_turn",
+                    "content": [
+                        {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "web_search",
+                            "input": {"query": "公开查询"},
+                        },
+                        {
+                            "type": "web_search_tool_result",
+                            "tool_use_id": "srvtoolu_1",
+                            "content": [],
+                        },
+                    ],
+                },
+                {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "续传后的答案。"}],
+                },
+            ]
+        )
+        bodies = []
+
+        def fake_post(body, endpoint, timeout):
+            bodies.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            return next(payloads)
+
+        client = DeepSeekClient("test-key")
+        with patch.object(client, "_post_anthropic", side_effect=fake_post):
+            answer, used_web, _, _ = await client._request_anthropic_web_response(
+                {
+                    "model": "deepseek-v4-flash",
+                    "instructions": "搜索后回答",
+                    "input": [{"role": "user", "content": "查询最新消息"}],
+                    "max_output_tokens": 512,
+                },
+                operation="测试",
+            )
+        self.assertTrue(used_web)
+        self.assertEqual(answer, "续传后的答案。")
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0]["tool_choice"], {"type": "any"})
+        self.assertEqual(bodies[1]["tool_choice"], {"type": "auto"})
+        self.assertEqual(bodies[1]["messages"][-1]["role"], "assistant")
 
     async def test_extract_future_event_json(self):
         response = {
@@ -1274,6 +1449,8 @@ class ConfigParsingTest(unittest.TestCase):
             "ERROR_LOG_AFTER_RECORDS": "4",
             "ERROR_LOG_MAX_BYTES": "4096",
             "ERROR_LOG_BACKUP_COUNT": "1",
+            "WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED": "off",
+            "WEB_SEARCH_MAX_USES": "4",
         }
         with patch.dict(os.environ, values, clear=True):
             config = BotConfig.from_env()
@@ -1292,6 +1469,8 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(config.deepseek_max_tokens, 4096)
         self.assertTrue(config.web_search_enabled)
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
+        self.assertFalse(config.web_search_anthropic_fallback_enabled)
+        self.assertEqual(config.web_search_max_uses, 4)
         self.assertTrue(config.error_log_enabled)
         self.assertEqual(config.error_log_path, "runtime/custom-errors.txt")
         self.assertEqual(config.error_log_before_records, 12)
@@ -1349,6 +1528,9 @@ class ConfigParsingTest(unittest.TestCase):
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},
             {"WEB_SEARCH_MAX_LOG_SOURCES": "-1"},
+            {"WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED": "perhaps"},
+            {"WEB_SEARCH_MAX_USES": "0"},
+            {"WEB_SEARCH_MAX_USES": "11"},
             {"ERROR_LOG_ENABLED": "perhaps"},
             {"ERROR_LOG_PATH": "   "},
             {"ERROR_LOG_BEFORE_RECORDS": "-1"},

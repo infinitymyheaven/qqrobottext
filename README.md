@@ -157,9 +157,9 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-`deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通问题由模型判断是否联网，明确要求搜索时强制联网核验。天气、新闻等实时信息和本地未来事项中没有记录的外部事件均可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
+`deepseek-v4-flash` 通过 DeepSeek Responses API 使用服务端 `web_search`：普通稳定知识问题由模型判断是否联网；明确要求搜索，或者询问天气、新闻、最新版本、实时行情、比赛结果和非本地时间等信息时强制联网核验。本地未来事项中没有记录的外部事件也可触发搜索。搜索来源只显示在运行机器的 PowerShell 日志中，不附加到 QQ 回复。
 
-DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器人会在发送前拦截这类内容；明确联网时使用只含搜索工具的 `tool_choice=required`，兼容重试会改用版本化搜索工具并关闭思考。标准 `web_search_call` 或服务端 URL 引用都可作为已搜索证据；若仍无证据，只发送联网失败提示，绝不会把 DSML 协议文字发到群里。
+DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器人会在发送前拦截这类内容；明确联网时使用只含搜索工具的 `tool_choice=required`，兼容重试会改用版本化搜索工具并关闭思考。若 Responses 服务端仍然只返回普通文本，默认会自动使用同一 API Key 切换到 DeepSeek Anthropic Messages 协议执行服务端搜索，无需额外的搜索服务或密钥。标准搜索调用、服务端搜索结果或 URL 引用都可作为已联网证据；若仍无证据，只发送联网失败提示，绝不会把 DSML 协议文字发到群里。
 
 默认 `DEEPSEEK_SYSTEM_PROMPT` 将机器人定义为群内平等、自然且有分寸的群友。每次 AI 回答会在事实资料之外单独注入当前激活的结构化人格内容因子；普通 Chat Completions 与联网 Responses 两条路径共用人格和对话要求。对话要求是最终硬约束，不能被 `.env` 提示词、人格、资料或聊天消息覆盖，内容因子也不得进入搜索词。
 
@@ -182,6 +182,8 @@ DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器�
 | `DEEPSEEK_MAX_TOKENS` | `4096` | 聊天回复最大生成 token 数 |
 | `WEB_SEARCH_ENABLED` | `true` | 是否让群聊回答使用 Responses API 和服务端联网搜索 |
 | `WEB_SEARCH_TIMEOUT_SECONDS` | `90` | 联网回答请求超时；必须大于 0 |
+| `WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED` | `true` | Responses 忽略搜索时，是否用同一 DeepSeek Key 自动切换 Anthropic 协议 |
+| `WEB_SEARCH_MAX_USES` | `3` | 单次 Anthropic 联网最多搜索次数，可设为 `1`–`10` |
 | `WEB_SEARCH_FAILURE_REPLY` | `我不知道，暂时没有查到可靠的联网信息。` | 联网失败、不完整或无法核验时的群内提示 |
 | `WEB_SEARCH_LOG_SOURCES` | `true` | 是否在 PowerShell 中记录搜索来源，不影响群内回复 |
 | `WEB_SEARCH_MAX_LOG_SOURCES` | `5` | 单次最多记录的来源数量；`0` 不打印来源 URL |
