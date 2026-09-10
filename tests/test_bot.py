@@ -763,7 +763,9 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             anthropic_body["tools"],
             [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
         )
-        self.assertEqual(anthropic_body["tool_choice"], {"type": "any"})
+        self.assertEqual(
+            anthropic_body["tool_choice"], {"type": "tool", "name": "web_search"}
+        )
         self.assertNotIn("123456789", json.dumps(anthropic_body, ensure_ascii=False))
         joined = "\n".join(logs.output)
         self.assertIn("Anthropic 协议完成联网", joined)
@@ -828,9 +830,57 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(used_web)
         self.assertEqual(answer, "续传后的答案。")
         self.assertEqual(len(bodies), 2)
-        self.assertEqual(bodies[0]["tool_choice"], {"type": "any"})
+        self.assertEqual(
+            bodies[0]["tool_choice"], {"type": "tool", "name": "web_search"}
+        )
         self.assertEqual(bodies[1]["tool_choice"], {"type": "auto"})
         self.assertEqual(bodies[1]["messages"][-1]["role"], "assistant")
+
+    async def test_anthropic_missing_search_retries_once_with_any(self):
+        payloads = iter(
+            [
+                {
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "未经搜索的回答"}],
+                },
+                {
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "server_tool_use", "name": "web_search_v2", "input": {}},
+                        {"type": "text", "text": "已核验回答"},
+                    ],
+                    "usage": {"server_tool_use": {"web_search_requests": 1}},
+                },
+            ]
+        )
+        bodies = []
+
+        def fake_post(body, endpoint, timeout):
+            bodies.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            return next(payloads)
+
+        client = DeepSeekClient("test-key")
+        with patch.object(client, "_post_anthropic", side_effect=fake_post), self.assertLogs(
+            "qqrobot", level="WARNING"
+        ) as logs:
+            answer, used_web, _, _ = await client._request_anthropic_web_response(
+                {
+                    "model": "deepseek-v4-flash",
+                    "instructions": "搜索后回答",
+                    "input": [{"role": "user", "content": "查询最新消息"}],
+                    "max_output_tokens": 512,
+                },
+                operation="测试",
+            )
+        self.assertTrue(used_web)
+        self.assertEqual(answer, "已核验回答")
+        self.assertEqual(
+            bodies[0]["tool_choice"], {"type": "tool", "name": "web_search"}
+        )
+        self.assertEqual(bodies[1]["tool_choice"], {"type": "any"})
+        joined = "\n".join(logs.output)
+        self.assertIn('"block_types":["text"]', joined)
+        self.assertNotIn("未经搜索的回答", joined)
 
     async def test_extract_future_event_json(self):
         response = {

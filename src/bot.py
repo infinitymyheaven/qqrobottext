@@ -1162,7 +1162,11 @@ class DeepSeekClient:
         request_body = {
             "model": str(responses_body.get("model") or self.model),
             "max_tokens": int(responses_body.get("max_output_tokens") or self.max_tokens),
-            "system": "\n".join(part for part in system_parts if part),
+            "system": (
+                "本次请求必须先由服务端执行 web_search，再根据搜索结果回答；"
+                "不得跳过搜索或仅凭模型记忆回答。\n"
+                + "\n".join(part for part in system_parts if part)
+            ),
             "messages": messages,
             "tools": [
                 {
@@ -1171,13 +1175,14 @@ class DeepSeekClient:
                     "max_uses": self.web_search_max_uses,
                 }
             ],
-            # any 配合唯一的 web_search 工具，强制服务端搜索。
-            "tool_choice": {"type": "any"},
+            "tool_choice": {"type": "tool", "name": "web_search"},
         }
         all_sources: list[dict] = []
         all_actions: list[dict] = []
         used_web = False
-        for _ in range(3):
+        search_retry_used = False
+        pause_count = 0
+        for _ in range(5):
             payload = await asyncio.to_thread(
                 self._post_anthropic,
                 request_body,
@@ -1193,6 +1198,28 @@ class DeepSeekClient:
             all_actions.extend(actions)
             if payload.get("stop_reason") != "pause_turn":
                 if not used_web:
+                    logger.warning(
+                        "%s Anthropic 响应缺少可验证的联网证据：%s",
+                        operation,
+                        json.dumps(
+                            self._anthropic_shape_summary(payload),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    if not search_retry_used:
+                        logger.warning(
+                            "%s Anthropic 指定搜索工具未生效，改用唯一工具 any 重试一次。",
+                            operation,
+                        )
+                        request_body = dict(request_body)
+                        request_body["tool_choice"] = {"type": "any"}
+                        request_body["system"] = (
+                            str(request_body["system"])
+                            + "\n上一次没有执行搜索；本次必须调用唯一的 web_search 工具。"
+                        )
+                        search_retry_used = True
+                        continue
                     raise DeepSeekAPIError("Anthropic 响应未执行 web_search")
                 if not answer:
                     raise DeepSeekAPIError("Anthropic 联网响应没有最终正文")
@@ -1202,6 +1229,9 @@ class DeepSeekClient:
             content = payload.get("content")
             if not isinstance(content, list):
                 raise DeepSeekAPIError("Anthropic pause_turn 缺少可续传的 content")
+            pause_count += 1
+            if pause_count > 3:
+                raise DeepSeekAPIError("Anthropic 联网连续 pause_turn，超过安全续传上限")
             request_body = dict(request_body)
             request_body["messages"] = [
                 *request_body["messages"],
@@ -1209,7 +1239,7 @@ class DeepSeekClient:
             ]
             # 续传时让服务端完成已开始的搜索，不再强制新建调用。
             request_body["tool_choice"] = {"type": "auto"}
-        raise DeepSeekAPIError("Anthropic 联网连续 pause_turn，超过安全续传上限")
+        raise DeepSeekAPIError("Anthropic 联网超过安全请求上限")
 
     async def extract_future_events(self, text: str, now: datetime) -> list[dict]:
         prompt = (
@@ -1609,7 +1639,8 @@ class DeepSeekClient:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
-            if block_type == "server_tool_use" and block.get("name") == "web_search":
+            tool_name = str(block.get("name") or "")
+            if block_type == "server_tool_use" and "web_search" in tool_name:
                 used_web = True
                 actions.append({"type": "search"})
                 continue
@@ -1659,6 +1690,39 @@ class DeepSeekClient:
         if not answer and not allow_empty:
             raise DeepSeekAPIError("DeepSeek Anthropic 返回了空回复")
         return answer, used_web or bool(sources), sources, actions
+
+    @staticmethod
+    def _anthropic_shape_summary(payload: dict) -> dict:
+        """返回不含正文、工具输入、URL 或引用内容的 Anthropic 结构摘要。"""
+        block_types: list[str] = []
+        tool_names: list[str] = []
+        citation_count = 0
+        content = payload.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_types.append(str(block.get("type") or "<missing>"))
+                name = block.get("name")
+                if isinstance(name, str) and name:
+                    tool_names.append(name[:80])
+                citations = block.get("citations")
+                if isinstance(citations, list):
+                    citation_count += len(citations)
+        usage = payload.get("usage")
+        server_usage = usage.get("server_tool_use") if isinstance(usage, dict) else None
+        search_requests = (
+            int(server_usage.get("web_search_requests") or 0)
+            if isinstance(server_usage, dict)
+            else 0
+        )
+        return {
+            "stop_reason": str(payload.get("stop_reason") or "<missing>"),
+            "block_types": block_types,
+            "tool_names": tool_names,
+            "citation_count": citation_count,
+            "web_search_requests": search_requests,
+        }
 
     @staticmethod
     def _responses_shape_summary(payload: dict) -> dict:
