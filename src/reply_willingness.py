@@ -642,18 +642,22 @@ class ReplyWillingnessEngine:
         text: str,
         message_id: str = "",
         display_name: str = "机器人",
+        strengthen_bond: bool = True,
     ) -> None:
-        """成功发送算法回复后记额度、关系和机器人消息流。"""
+        """成功发送算法回复后记额度、可选关系强化和机器人消息流。"""
         self.store.record_algorithm_reply(group_id, local_date, now)
-        self.store.update_willingness_bond(
-            group_id,
-            user_id,
-            now,
-            self.config.bond_outbound_rate,
-            grace_seconds=self.config.bond_grace_hours * 3600,
-            zero_seconds=self.config.bond_zero_days * 86400,
-            outbound=True,
-        )
+        # 第三内容指标可能把一次逻辑回答发成多条；实际消息都消耗额度，
+        # 但只有第一条代表一次新的互动，避免关系强度被分段数放大。
+        if strengthen_bond:
+            self.store.update_willingness_bond(
+                group_id,
+                user_id,
+                now,
+                self.config.bond_outbound_rate,
+                grace_seconds=self.config.bond_grace_hours * 3600,
+                zero_seconds=self.config.bond_zero_days * 86400,
+                outbound=True,
+            )
         self._last_bot_reply_at[str(group_id)] = now
         # 回复事件必须立即让下一条消息看到降温，不能等待旧快照自然满五秒。
         self._snapshots.pop(str(group_id), None)

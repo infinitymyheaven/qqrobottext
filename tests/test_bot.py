@@ -81,6 +81,31 @@ class FakeWebSocket:
         future.set_result({"status": "ok", "retcode": 0, "data": response_data})
 
 
+class FailNthGroupSendWebSocket(FakeWebSocket):
+    """在指定的群消息发送序号抛错，用于验证部分成功后的停止行为。"""
+
+    def __init__(self, pending, fail_at: int):
+        super().__init__(pending)
+        self.fail_at = fail_at
+        self.group_send_count = 0
+
+    async def send(self, raw: str):
+        action = json.loads(raw)
+        self.sent.append(action)
+        if action["action"] == "send_group_msg":
+            self.group_send_count += 1
+            if self.group_send_count == self.fail_at:
+                raise OSError("模拟分段发送失败")
+        future = self.pending[action["echo"]]
+        future.set_result(
+            {
+                "status": "ok",
+                "retcode": 0,
+                "data": {"message_id": f"sent-{self.group_send_count}"},
+            }
+        )
+
+
 class FakeLLM:
     def __init__(self, *, events=None):
         self.chat_calls = []
@@ -938,6 +963,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             memory=self.store,
             now_provider=lambda: self.current,
             rng=FixedRNG(),
+            delivery_rng=FixedRNG(uniform_value=1.0),
         )
         self.pending = {}
         self.ws = FakeWebSocket(self.pending)
@@ -1081,6 +1107,145 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         )
         await limited._handle_group_message(self.ws, event, self.pending)
         self.assertEqual(len(self.llm.chat_calls), 2)
+
+    async def test_model_reply_segments_are_sent_counted_and_recorded_in_order(self):
+        answer = "好呀，马上来。你等我？"
+        self.bot.llm_client.chat = AsyncMock(return_value=answer)
+        next_id = iter(("reply-1", "reply-2", "reply-3"))
+        ws = FakeWebSocket(
+            self.pending,
+            {"send_group_msg": lambda _params: {"message_id": next(next_id)}},
+        )
+
+        with patch("src.bot.asyncio.sleep", new=AsyncMock()) as mocked_sleep, self.assertLogs(
+            "qqrobot", level="INFO"
+        ) as captured:
+            await self.bot._handle_group_message(ws, mention_event("来吗"), self.pending)
+
+        sent = [item["params"]["message"] for item in ws.sent]
+        self.assertEqual(sent, ["好呀", "马上来", "你等我？"])
+        self.assertEqual(mocked_sleep.await_count, 2)
+        self.assertEqual(
+            self.store.get_algorithm_reply_count(
+                GROUP_ID, self.current.date().isoformat()
+            ),
+            3,
+        )
+        bot_messages = [
+            item
+            for item in self.bot.willingness.messages(
+                GROUP_ID, self.current.timestamp()
+            )
+            if item.is_bot
+        ]
+        self.assertEqual([item.text for item in bot_messages], sent)
+        self.assertEqual(
+            [item.message_id for item in bot_messages],
+            ["reply-1", "reply-2", "reply-3"],
+        )
+        # @ 先把关系提升到 0.12；整次回答只再按 8% 向 1 靠近一次。
+        bond = self.store.get_willingness_bond(
+            GROUP_ID,
+            "20002",
+            self.current.timestamp(),
+            grace_seconds=86_400,
+            zero_seconds=30 * 86_400,
+        )
+        self.assertAlmostEqual(bond, 0.12 + (1.0 - 0.12) * 0.08)
+        self.assertEqual(
+            self.bot._histories[(GROUP_ID, "20002")][-1],
+            {"role": "assistant", "content": answer},
+        )
+        delivery_line = next(
+            line for line in captured.output if "回复发送规划 " in line
+        )
+        self.assertNotIn(answer, delivery_line)
+        self.assertIn('"segment_count": 3', delivery_line)
+
+    async def test_remaining_daily_quota_merges_delivery_tail(self):
+        config = BotConfig(
+            active_group_ids=frozenset({GROUP_ID}),
+            timezone=TZ,
+            willingness_daily_reply_limit=2,
+        )
+        llm = FakeLLM()
+        llm.chat = AsyncMock(return_value="一，二，三，四。")
+        bot = QQBot(
+            "ws://test",
+            llm_client=llm,
+            config=config,
+            memory=self.store,
+            now_provider=lambda: self.current,
+            rng=FixedRNG(),
+            delivery_rng=FixedRNG(uniform_value=1.0),
+        )
+        bot._joined_group_ids.add(GROUP_ID)
+        with patch("src.bot.asyncio.sleep", new=AsyncMock()):
+            await bot._handle_group_message(
+                self.ws, mention_event("额度测试"), self.pending
+            )
+        self.assertEqual(
+            [item["params"]["message"] for item in self.ws.sent],
+            ["一", "二，三，四"],
+        )
+        self.assertEqual(
+            self.store.get_algorithm_reply_count(
+                GROUP_ID, self.current.date().isoformat()
+            ),
+            2,
+        )
+
+        await bot._handle_group_message(
+            self.ws, mention_event("不能再回复"), self.pending
+        )
+        self.assertEqual(llm.chat.await_count, 1)
+
+    async def test_partial_segment_failure_stops_tail_and_keeps_full_history(self):
+        answer = "第一句，第二句，第三句。"
+        self.bot.llm_client.chat = AsyncMock(return_value=answer)
+        ws = FailNthGroupSendWebSocket(self.pending, fail_at=2)
+        with patch("src.bot.asyncio.sleep", new=AsyncMock()), self.assertLogs(
+            "qqrobot", level="ERROR"
+        ):
+            await self.bot._handle_group_message(
+                ws, mention_event("部分失败"), self.pending
+            )
+        # 第二条已经尝试但失败，第三条不得继续调用 OneBot。
+        self.assertEqual(
+            [item["params"]["message"] for item in ws.sent],
+            ["第一句", "第二句"],
+        )
+        self.assertEqual(
+            self.store.get_algorithm_reply_count(
+                GROUP_ID, self.current.date().isoformat()
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.bot._histories[(GROUP_ID, "20002")][-1]["content"], answer
+        )
+
+    async def test_concurrent_segmented_replies_do_not_interleave(self):
+        async def answer(_history, user_text, **_kwargs):
+            return "甲，乙。" if user_text == "第一条" else "丙，丁。"
+
+        self.bot.llm_client.chat = AsyncMock(side_effect=answer)
+        original_sleep = asyncio.sleep
+
+        async def yield_once(_delay):
+            await original_sleep(0)
+
+        with patch("src.bot.asyncio.sleep", new=yield_once):
+            await asyncio.gather(
+                self.bot._handle_group_message(
+                    self.ws, mention_event("第一条", user_id="20002"), self.pending
+                ),
+                self.bot._handle_group_message(
+                    self.ws, mention_event("第二条", user_id="20003"), self.pending
+                ),
+            )
+        sent = [item["params"]["message"] for item in self.ws.sent]
+        self.assertIn(sent, (["甲", "乙", "丙", "丁"], ["丙", "丁", "甲", "乙"]))
 
     async def test_concurrent_messages_are_serialized_without_hard_interval(self):
         first = group_event(
@@ -1501,6 +1666,9 @@ class ConfigParsingTest(unittest.TestCase):
             "ERROR_LOG_BACKUP_COUNT": "1",
             "WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED": "off",
             "WEB_SEARCH_MAX_USES": "4",
+            "CHAT_SPLIT_ELIGIBLE_MAX_CHARS": "55",
+            "CHAT_SPLIT_MAX_SEGMENTS": "5",
+            "CHAT_TYPING_SPEED": "1.5",
         }
         with patch.dict(os.environ, values, clear=True):
             config = BotConfig.from_env()
@@ -1521,6 +1689,9 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertEqual(config.web_search_timeout_seconds, 90.0)
         self.assertFalse(config.web_search_anthropic_fallback_enabled)
         self.assertEqual(config.web_search_max_uses, 4)
+        self.assertEqual(config.chat_split_eligible_max_chars, 55)
+        self.assertEqual(config.chat_split_max_segments, 5)
+        self.assertEqual(config.chat_typing_speed, 1.5)
         self.assertTrue(config.error_log_enabled)
         self.assertEqual(config.error_log_path, "runtime/custom-errors.txt")
         self.assertEqual(config.error_log_before_records, 12)
@@ -1581,6 +1752,12 @@ class ConfigParsingTest(unittest.TestCase):
             {"WEB_SEARCH_ANTHROPIC_FALLBACK_ENABLED": "perhaps"},
             {"WEB_SEARCH_MAX_USES": "0"},
             {"WEB_SEARCH_MAX_USES": "11"},
+            {"CHAT_SPLIT_ELIGIBLE_MAX_CHARS": "0"},
+            {"CHAT_SPLIT_ELIGIBLE_MAX_CHARS": "2001"},
+            {"CHAT_SPLIT_MAX_SEGMENTS": "0"},
+            {"CHAT_SPLIT_MAX_SEGMENTS": "21"},
+            {"CHAT_TYPING_SPEED": "-0.1"},
+            {"CHAT_TYPING_SPEED": "nan"},
             {"ERROR_LOG_ENABLED": "perhaps"},
             {"ERROR_LOG_PATH": "   "},
             {"ERROR_LOG_BEFORE_RECORDS": "-1"},

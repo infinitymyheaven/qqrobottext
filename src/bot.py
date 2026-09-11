@@ -27,6 +27,7 @@ import websockets
 if __package__:
     from .conversation_requirements import ConversationRequirements
     from .error_logging import install_error_context_handler
+    from .message_delivery import DeliveryPolicy, plan_reply
     from .memory import MemoryStore
     from .persona import (
         ContentFactor,
@@ -48,6 +49,7 @@ if __package__:
 else:  # 支持 README 中的 `python src\bot.py` 直接启动方式。
     from conversation_requirements import ConversationRequirements
     from error_logging import install_error_context_handler
+    from message_delivery import DeliveryPolicy, plan_reply
     from memory import MemoryStore
     from persona import (
         ContentFactor,
@@ -389,6 +391,10 @@ class BotConfig:
     max_history_messages: int = 10
     chat_history_ttl_minutes: int = 30
     max_reply_chars: int = 2000
+    # 第三内容指标只拆分不超过阈值的短回答，并为后续分段估算打字延迟。
+    chat_split_eligible_max_chars: int = 60
+    chat_split_max_segments: int = 6
+    chat_typing_speed: float = 1.0
     morning_greeting_enabled: bool = True
     night_greeting_enabled: bool = True
     morning_messages: tuple[str, ...] = MORNING_MESSAGES
@@ -625,6 +631,15 @@ class BotConfig:
                 "CHAT_HISTORY_TTL_MINUTES", 30, minimum=0
             ),
             max_reply_chars=_env_int("MAX_REPLY_CHARS", 2000, minimum=1),
+            chat_split_eligible_max_chars=_env_int(
+                "CHAT_SPLIT_ELIGIBLE_MAX_CHARS", 60, minimum=1, maximum=2000
+            ),
+            chat_split_max_segments=_env_int(
+                "CHAT_SPLIT_MAX_SEGMENTS", 6, minimum=1, maximum=20
+            ),
+            chat_typing_speed=_env_float(
+                "CHAT_TYPING_SPEED", 1.0, minimum=0, maximum=10
+            ),
             morning_greeting_enabled=_env_bool("MORNING_GREETING_ENABLED", True),
             night_greeting_enabled=_env_bool("NIGHT_GREETING_ENABLED", True),
             morning_messages=_env_messages("MORNING_GREETING_MESSAGES", MORNING_MESSAGES),
@@ -704,6 +719,14 @@ class BotConfig:
             bond_grace_hours=self.willingness_bond_grace_hours,
             bond_zero_days=self.willingness_bond_zero_days,
             reply_cooldown_seconds=self.willingness_reply_cooldown_seconds,
+        )
+
+    def delivery_policy(self) -> DeliveryPolicy:
+        """把应用配置投影为第三内容指标使用的纯发送策略。"""
+        return DeliveryPolicy(
+            split_eligible_max_chars=self.chat_split_eligible_max_chars,
+            max_segments=self.chat_split_max_segments,
+            typing_speed=self.chat_typing_speed,
         )
 
 
@@ -1829,6 +1852,7 @@ class QQBot:
         memory: MemoryStore | None = None,
         now_provider: Callable[[], datetime] | None = None,
         rng=None,
+        delivery_rng=None,
     ) -> None:
         self.log_url = ws_url
         self.ws_url = with_access_token(ws_url, token)
@@ -1838,6 +1862,8 @@ class QQBot:
         self._owns_memory = memory is None
         self._now_provider = now_provider or (lambda: datetime.now(self.config.timezone))
         self.rng = rng or random.SystemRandom()
+        # 打字延迟使用独立随机源，避免增加一个分段后改变意愿算法的抽样序列。
+        self.delivery_rng = delivery_rng or random.SystemRandom()
         # 群上下文在交给任何 LLM 前也复用第二指标的本地分类器。生产环境与
         # DeepSeekClient 共享同一实例；测试替身没有该属性时使用等价默认实现。
         self.conversation_requirements = getattr(
@@ -2079,6 +2105,7 @@ class QQBot:
                         self_id,
                         now,
                         not mentioned,
+                        max(0, decision.daily_limit - decision.daily_replies),
                     )
 
             # active_window_all：回答时段内所有候选消息都提取未来事项。
@@ -2126,6 +2153,7 @@ class QQBot:
         self_id: str,
         now: datetime,
         spontaneous: bool,
+        available_messages: int,
     ) -> bool:
         if self.llm_client is None:
             await self._send_group_message(
@@ -2178,14 +2206,37 @@ class QQBot:
                     willingness_user_id=user_id,
                 )
                 return True
-            await self._send_group_message(
+            # 第三指标只处理已经通过第二指标校验的最终正文。每日剩余额度会
+            # 收敛最大分段数，溢出的句子并入最后一条而不是被截掉。
+            delivery = plan_reply(
+                answer,
+                available_messages,
+                policy=self.config.delivery_policy(),
+                rng=self.delivery_rng,
+            )
+            logger.info(
+                "回复发送规划 %s",
+                json.dumps(
+                    {
+                        "event": "reply_delivery_plan",
+                        "group_id": str(group_id),
+                        "total_chars": delivery.total_chars,
+                        "segment_count": len(delivery.segments),
+                        "split": delivery.split,
+                        "delays_seconds": [round(value, 3) for value in delivery.delays],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            sent_count = await self._send_answer_plan(
                 ws,
                 group_id,
-                answer,
+                user_id,
                 pending,
-                now=now,
+                delivery.segments,
+                delivery.delays,
                 spontaneous=spontaneous,
-                willingness_user_id=user_id,
             )
             updated = history + [
                 {"role": "user", "content": question},
@@ -2199,7 +2250,53 @@ class QQBot:
             else:
                 self._histories.pop(conversation_id, None)
                 self._history_last_active.pop(conversation_id, None)
-            return True
+            return sent_count > 0
+
+    async def _send_answer_plan(
+        self,
+        ws,
+        group_id: str,
+        user_id: str,
+        pending: dict,
+        segments: Sequence[str],
+        delays: Sequence[float],
+        *,
+        spontaneous: bool,
+    ) -> int:
+        """按顺序执行模型回复计划，并正确处理部分发送成功的情况。"""
+        sent_count = 0
+        for index, segment in enumerate(segments):
+            delay = float(delays[index]) if index < len(delays) else 0.0
+            if delay > 0:
+                # 当前调用仍持有同群回复锁；等待期间新消息可以入流，但不会让
+                # 另一组机器人回复插入本次连续发送。
+                await asyncio.sleep(delay)
+            try:
+                await self._send_group_message(
+                    ws,
+                    group_id,
+                    segment,
+                    pending,
+                    now=self.now(),
+                    spontaneous=spontaneous,
+                    willingness_user_id=user_id,
+                    # 一次逻辑回答只增强一次关系，后续分段仍正常计额度和冷却。
+                    strengthen_willingness_bond=sent_count == 0,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                if sent_count == 0:
+                    raise
+                logger.exception(
+                    "群 %s 的模型回复第 %s/%s 段发送失败，停止余下分段",
+                    group_id,
+                    index + 1,
+                    len(segments),
+                )
+                break
+            sent_count += 1
+        return sent_count
 
     def _prune_expired_histories(self, now: datetime) -> None:
         ttl_seconds = self.config.chat_history_ttl_minutes * 60
@@ -2689,6 +2786,7 @@ class QQBot:
         morning: bool = False,
         night: bool = False,
         willingness_user_id: str | None = None,
+        strengthen_willingness_bond: bool = True,
     ) -> str:
         output = message
         if isinstance(output, str) and len(output) > self.config.max_reply_chars:
@@ -2719,6 +2817,7 @@ class QQBot:
                 sent_at.timestamp(),
                 text=output_text,
                 message_id=message_id,
+                strengthen_bond=strengthen_willingness_bond,
             )
         else:
             # 问候和提醒不计额度，但必须进入消息流以影响后续环境和防抢话冷却。
