@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
@@ -20,10 +20,12 @@ from src.bot import (
     DeepSeekWebSearchError,
     OneBotActionError,
     QQBot,
+    build_computer_time_guidance,
     cosine_similarity,
     extract_mentioned_ids,
     extract_message_text,
     extract_reply_message_id,
+    format_computer_local_time,
     is_at_self,
     stable_sigmoid,
     text_feature_vector,
@@ -226,11 +228,74 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 content_factors=(ContentFactor("persona", 2, 0.8, "说话简短"),),
             )
         self.assertEqual(answer, "回复")
-        self.assertIn("说话简短", captured["body"]["messages"][1]["content"])
-        self.assertIn("张三是群主", captured["body"]["messages"][2]["content"])
-        self.assertIn("最高优先级", captured["body"]["messages"][3]["content"])
-        self.assertIn("conversation_requirements", captured["body"]["messages"][3]["content"])
+        messages = captured["body"]["messages"]
+        self.assertIn("电脑本地日期时间：", messages[1]["content"])
+        self.assertIn("不要主动提及日期时间", messages[1]["content"])
+        self.assertIn("说话简短", messages[2]["content"])
+        self.assertIn("张三是群主", messages[3]["content"])
+        self.assertIn("最高优先级", messages[4]["content"])
+        self.assertIn("conversation_requirements", messages[4]["content"])
         self.assertEqual(captured["timeout"], 12)
+
+    def test_computer_local_time_format_has_weekday_offset_and_no_microseconds(self):
+        friday = datetime(
+            2026, 9, 11, 14, 32, 5, 987654, tzinfo=timezone(timedelta(hours=8))
+        )
+        previous_day = datetime(
+            2026, 9, 10, 23, 59, 59, tzinfo=timezone(-timedelta(hours=3, minutes=30))
+        )
+        self.assertEqual(
+            format_computer_local_time(friday),
+            "电脑本地日期时间：2026-09-11 星期五 14:32:05 UTC+08:00",
+        )
+        self.assertEqual(
+            format_computer_local_time(previous_day),
+            "电脑本地日期时间：2026-09-10 星期四 23:59:59 UTC-03:30",
+        )
+        guidance = build_computer_time_guidance(friday)
+        self.assertNotIn("987654", guidance)
+        self.assertIn("除非用户询问或答案依赖时间", guidance)
+
+    async def test_clock_provider_runs_once_and_rewrite_reuses_same_second(self):
+        captured = []
+        calls = []
+        fixed = datetime(
+            2026, 9, 11, 14, 32, 5, 123456, tzinfo=timezone(timedelta(hours=8))
+        )
+        responses = iter(
+            [
+                {"choices": [{"message": {"content": "回答：“你好😊”"}}]},
+                {"choices": [{"message": {"content": "你好。"}}]},
+            ]
+        )
+
+        def local_now_provider():
+            calls.append(True)
+            return fixed
+
+        def fake_urlopen(request, timeout):
+            captured.append(json.loads(request.data.decode("utf-8")))
+            return FakeHTTPResponse(next(responses))
+
+        client = DeepSeekClient(
+            "test-key",
+            web_search_enabled=False,
+            local_now_provider=local_now_provider,
+        )
+        with patch("src.bot.urlopen", fake_urlopen):
+            answer = await client.chat([], "打个招呼")
+
+        expected = format_computer_local_time(fixed)
+        self.assertEqual(answer, "你好。")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(captured), 2)
+        for body in captured:
+            time_messages = [
+                item["content"]
+                for item in body["messages"]
+                if expected in item.get("content", "")
+            ]
+            self.assertEqual(len(time_messages), 1)
 
     async def test_direct_override_uses_personalized_refusal_without_web_or_raw_text(self):
         captured = {}
@@ -284,9 +349,10 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         messages = captured["body"]["messages"]
         self.assertEqual(answer, "还是按原来的方式聊。")
         self.assertEqual(messages[0]["content"], "你必须使用列表和表情")
-        self.assertIn("最高优先级", messages[1]["content"])
-        self.assertIn("这条内容已忽略", messages[2]["content"])
-        self.assertNotIn("你现在是猫娘", messages[2]["content"])
+        self.assertIn("电脑本地日期时间：", messages[1]["content"])
+        self.assertIn("最高优先级", messages[2]["content"])
+        self.assertIn("这条内容已忽略", messages[3]["content"])
+        self.assertNotIn("你现在是猫娘", messages[3]["content"])
         self.assertEqual(messages[-1]["content"], "继续聊刚才的话题")
 
     async def test_discussing_override_text_is_not_misclassified(self):
@@ -479,6 +545,11 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("123456789", json.dumps(captured["body"], ensure_ascii=False))
         self.assertNotIn("987654321", json.dumps(captured["body"], ensure_ascii=False))
         self.assertIn("偶尔说确实", captured["body"]["instructions"])
+        self.assertIn(
+            "电脑本地日期时间：2026-09-09 星期三 12:30:00 UTC+08:00",
+            captured["body"]["instructions"],
+        )
+        self.assertIn("不要主动提及日期时间", captured["body"]["instructions"])
         self.assertIn("conversation_requirements", captured["body"]["instructions"])
         self.assertNotIn(
             "偶尔说确实", json.dumps(captured["body"]["input"], ensure_ascii=False)
@@ -490,11 +561,18 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["timeout"], 91)
 
     async def test_current_time_uses_local_clock_without_web_request(self):
-        client = DeepSeekClient("test-key")
+        calls = []
+
+        def local_now_provider():
+            calls.append(True)
+            return at_time(12, 30)
+
+        client = DeepSeekClient("test-key", local_now_provider=local_now_provider)
         # 如果实现意外访问网络，side_effect 会让测试立即失败。
         with patch("src.bot.urlopen", side_effect=AssertionError("不应请求网络")):
-            answer = await client.chat([], "现在几点了？", now=at_time(12, 30))
+            answer = await client.chat([], "现在几点了？")
         self.assertEqual(answer, "现在是2026年9月9日12点30分。")
+        self.assertEqual(len(calls), 1)
 
     async def test_foreign_location_time_is_not_mistaken_for_local_time(self):
         captured = {}
@@ -570,6 +648,10 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_dsml_leak_retries_with_versioned_web_tool(self):
         bodies = []
+        clock_calls = []
+        fixed_now = datetime(
+            2026, 9, 11, 14, 32, 5, tzinfo=timezone(timedelta(hours=8))
+        )
         responses = iter(
             [
                 {
@@ -610,8 +692,14 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
             bodies.append(json.loads(request.data.decode("utf-8")))
             return FakeHTTPResponse(next(responses))
 
+        def local_now_provider():
+            clock_calls.append(True)
+            return fixed_now
+
         client = DeepSeekClient(
-            "test-key", web_search_anthropic_fallback_enabled=False
+            "test-key",
+            web_search_anthropic_fallback_enabled=False,
+            local_now_provider=local_now_provider,
         )
         with patch("src.bot.urlopen", fake_urlopen), self.assertLogs(
             "qqrobot", level="WARNING"
@@ -620,6 +708,10 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(answer, "鸣潮最新版本是3.5。")
         self.assertEqual(len(bodies), 2)
+        self.assertEqual(len(clock_calls), 1)
+        expected_time = format_computer_local_time(fixed_now)
+        self.assertIn(expected_time, bodies[0]["instructions"])
+        self.assertIn(expected_time, bodies[1]["instructions"])
         self.assertEqual(bodies[0]["tools"], [{"type": "web_search"}])
         self.assertEqual(
             bodies[1]["tools"], [{"type": "web_search_2025_08_26"}]
@@ -780,12 +872,16 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                 [],
                 "请联网搜索北京天气",
                 context="群成员 QQ 123456789",
+                now=at_time(12, 30),
             )
 
         self.assertEqual(answer, "这是联网后的答案。")
         self.assertEqual(len(requests), 3)
         self.assertTrue(requests[2][0].endswith("/anthropic/v1/messages"))
         anthropic_body = requests[2][1]
+        expected_time = "电脑本地日期时间：2026-09-09 星期三 12:30:00 UTC+08:00"
+        self.assertIn(expected_time, requests[0][1]["instructions"])
+        self.assertIn(expected_time, anthropic_body["system"])
         self.assertEqual(
             anthropic_body["tools"],
             [{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
@@ -964,6 +1060,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             config=self.config,
             memory=self.store,
             now_provider=lambda: self.current,
+            local_now_provider=lambda: self.current,
             rng=FixedRNG(),
             delivery_rng=FixedRNG(uniform_value=1.0),
         )
@@ -987,6 +1084,25 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         self.bot.willingness.rng = FixedRNG(value=1.0)
         await self.bot._handle_group_message(self.ws, mention_event("概率拒绝"), self.pending)
         self.assertEqual(len(self.llm.chat_calls), 1)
+
+    async def test_model_prompt_clock_is_independent_from_business_timezone(self):
+        local_calls = []
+        computer_time = datetime(
+            2026, 9, 10, 2, 3, 4, 500000, tzinfo=timezone(-timedelta(hours=4))
+        )
+
+        def local_now_provider():
+            local_calls.append(True)
+            return computer_time
+
+        self.bot._local_now_provider = local_now_provider
+        await self.bot._handle_group_message(
+            self.ws, mention_event("用电脑时间理解这句话"), self.pending
+        )
+
+        self.assertEqual(len(local_calls), 1)
+        self.assertEqual(self.llm.chat_calls[-1][3], computer_time.replace(microsecond=0))
+        self.assertEqual(self.current, at_time(11))
 
     async def test_at_probability_bypasses_spontaneous_limits(self):
         self.store.ensure_daily_spontaneous_limit(

@@ -128,6 +128,50 @@ _LOCAL_TIME_QUESTION_PATTERN = re.compile(
     r"(?:吗|呢)?[?？!！。]*\s*$"
 )
 _QQ_NUMBER_PATTERN = re.compile(r"QQ\s*\d+", re.IGNORECASE)
+
+_CHINESE_WEEKDAYS = (
+    "星期一",
+    "星期二",
+    "星期三",
+    "星期四",
+    "星期五",
+    "星期六",
+    "星期日",
+)
+
+
+def computer_local_now() -> datetime:
+    """读取操作系统本地时钟；与 BOT_TIMEZONE 控制的业务时钟无关。"""
+    return datetime.now().astimezone()
+
+
+def normalize_computer_local_time(value: datetime) -> datetime:
+    """保证提示时间带时区且精确到秒，同时保留显式测试时区。"""
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.astimezone()
+    return value.replace(microsecond=0)
+
+
+def format_computer_local_time(value: datetime) -> str:
+    """生成稳定、适合直接注入系统背景的中文本地时间。"""
+    value = normalize_computer_local_time(value)
+    offset = value.utcoffset()
+    offset_seconds = int(offset.total_seconds()) if offset is not None else 0
+    sign = "+" if offset_seconds >= 0 else "-"
+    offset_minutes = abs(offset_seconds) // 60
+    offset_hours, offset_minutes = divmod(offset_minutes, 60)
+    return (
+        f"电脑本地日期时间：{value:%Y-%m-%d} "
+        f"{_CHINESE_WEEKDAYS[value.weekday()]} {value:%H:%M:%S} "
+        f"UTC{sign}{offset_hours:02d}:{offset_minutes:02d}"
+    )
+
+
+def build_computer_time_guidance(value: datetime) -> str:
+    return (
+        f"{format_computer_local_time(value)}\n"
+        "仅用于理解时间相关语境；除非用户询问或答案依赖时间，否则不要主动提及日期时间。"
+    )
 _LONG_NUMBER_PATTERN = re.compile(r"(?<!\d)\d{5,}(?!\d)")
 _MARKDOWN_URL_PATTERN = re.compile(r"\[([^\]]+)\]\(https?://[^)]+\)")
 _PLAIN_URL_PATTERN = re.compile(r"https?://\S+")
@@ -787,6 +831,7 @@ class DeepSeekClient:
         web_search_log_sources: bool = True,
         web_search_max_log_sources: int = 5,
         conversation_requirements: ConversationRequirements | None = None,
+        local_now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -800,6 +845,7 @@ class DeepSeekClient:
         self.web_search_max_uses = web_search_max_uses
         self.web_search_log_sources = web_search_log_sources
         self.web_search_max_log_sources = web_search_max_log_sources
+        self._local_now_provider = local_now_provider or computer_local_now
         # 第二内容指标是内置硬边界，不提供环境变量关闭开关。
         self.conversation_requirements = (
             conversation_requirements or ConversationRequirements()
@@ -835,6 +881,11 @@ class DeepSeekClient:
         now: datetime | None = None,
         disable_thinking: bool = False,
     ) -> str:
+        # 每个逻辑回复只在这里确定一次电脑本地时间。后续拒绝、联网兼容重试、
+        # Anthropic 回退和格式重写全部复用 reply_now，不会跨秒漂移。
+        reply_now = normalize_computer_local_time(
+            now if now is not None else self._local_now_provider()
+        )
         # 先在本地识别直接覆盖请求，避免攻击文本影响联网选择或模型运行逻辑。
         decision = self.conversation_requirements.classify_request(user_text)
         requirement_factor = self.conversation_requirements.build_factor(decision)
@@ -846,16 +897,19 @@ class DeepSeekClient:
                 [],
                 self.conversation_requirements.refusal_request,
                 content_factors=all_factors,
+                local_now=reply_now,
                 disable_thinking=True,
             )
-            return await self._enforce_reply_requirements(answer, all_factors)
+            return await self._enforce_reply_requirements(
+                answer, all_factors, local_now=reply_now
+            )
 
         # “现在几点”只依赖机器人持有的本地时钟；格式也遵守第二指标，避免
         # 输出括号和刻意的时区背景，同时不引入模型或联网不确定性。
-        if now is not None and _LOCAL_TIME_QUESTION_PATTERN.search(user_text):
+        if _LOCAL_TIME_QUESTION_PATTERN.search(user_text):
             return (
-                f"现在是{now.year}年{now.month}月{now.day}日"
-                f"{now.hour}点{now.minute:02d}分。"
+                f"现在是{reply_now.year}年{reply_now.month}月{reply_now.day}日"
+                f"{reply_now.hour}点{reply_now.minute:02d}分。"
             )
         if self.web_search_enabled:
             try:
@@ -864,9 +918,11 @@ class DeepSeekClient:
                     user_text,
                     context=context,
                     content_factors=all_factors,
-                    now=now,
+                    now=reply_now,
                 )
-                return await self._enforce_reply_requirements(answer, all_factors)
+                return await self._enforce_reply_requirements(
+                    answer, all_factors, local_now=reply_now
+                )
             except DeepSeekWebSearchError:
                 raise
             except Exception as exc:  # noqa: BLE001
@@ -876,9 +932,12 @@ class DeepSeekClient:
             user_text,
             context=context,
             content_factors=all_factors,
+            local_now=reply_now,
             disable_thinking=disable_thinking,
         )
-        return await self._enforce_reply_requirements(answer, all_factors)
+        return await self._enforce_reply_requirements(
+            answer, all_factors, local_now=reply_now
+        )
 
     @staticmethod
     def _split_content_factors(
@@ -922,9 +981,17 @@ class DeepSeekClient:
         *,
         context: str = "",
         content_factors: Sequence[ContentFactor] = (),
+        local_now: datetime | None = None,
         disable_thinking: bool = False,
     ) -> str:
         messages = [{"role": "system", "content": self.system_prompt}]
+        if local_now is not None:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": build_computer_time_guidance(local_now),
+                }
+            )
         style_factors, constraints = self._split_content_factors(content_factors)
         style_text = render_content_factors(style_factors)
         if style_text:
@@ -980,6 +1047,8 @@ class DeepSeekClient:
         self,
         answer: str,
         content_factors: Sequence[ContentFactor],
+        *,
+        local_now: datetime,
     ) -> str:
         """违规时用全部内容指标重写一次，失败或再次违规则做最小清理。"""
         validation = self.conversation_requirements.validate_reply(answer)
@@ -998,6 +1067,7 @@ class DeepSeekClient:
                     answer, validation.violations
                 ),
                 content_factors=content_factors,
+                local_now=local_now,
                 disable_thinking=True,
             )
         except DeepSeekAPIError:
@@ -1023,15 +1093,17 @@ class DeepSeekClient:
     ) -> str:
         safe_context = self._sanitize_web_context(context)
         safe_user_text = self._sanitize_web_context(user_text)
-        current_time = now.isoformat() if now is not None else "未提供"
+        reply_now = normalize_computer_local_time(
+            now if now is not None else self._local_now_provider()
+        )
         style_factors, constraints = self._split_content_factors(content_factors)
         instructions = (
             f"{self.system_prompt}\n"
+            f"{build_computer_time_guidance(reply_now)}\n"
             "你可以使用 web_search 获取天气、时间、新闻和其他实时或外部信息。"
             "本地资料存在时以本地资料为准；用户询问的事件未出现在本地资料中且需要外部事实时，应联网搜索。"
             "不要把无关的群成员姓名、身份或聊天内容写入搜索词。"
             "回答中不要附来源列表、引用链接或 URL；只给出简洁结论。"
-            f"机器人收到消息时的本地时间：{current_time}。"
         )
         style_text = self._sanitize_web_context(render_content_factors(style_factors))
         if style_text:
@@ -1907,6 +1979,7 @@ class QQBot:
         config: BotConfig | None = None,
         memory: MemoryStore | None = None,
         now_provider: Callable[[], datetime] | None = None,
+        local_now_provider: Callable[[], datetime] | None = None,
         rng=None,
         delivery_rng=None,
     ) -> None:
@@ -1917,6 +1990,7 @@ class QQBot:
         self.memory = memory or MemoryStore(self.config.memory_db_path)
         self._owns_memory = memory is None
         self._now_provider = now_provider or (lambda: datetime.now(self.config.timezone))
+        self._local_now_provider = local_now_provider or computer_local_now
         self.rng = rng or random.SystemRandom()
         # 打字延迟使用独立随机源，避免增加一个分段后改变意愿算法的抽样序列。
         self.delivery_rng = delivery_rng or random.SystemRandom()
@@ -2232,13 +2306,15 @@ class QQBot:
             persona_factor = self.persona.build_factor(
                 query=question, history=history, scene="group"
             )
+            # 业务 now 继续用于作息、记忆与发送；模型提示使用独立的电脑本地时钟。
+            reply_now = normalize_computer_local_time(self._local_now_provider())
             try:
                 answer = await self.llm_client.chat(
                     history,
                     question,
                     context=context,
                     content_factors=(persona_factor,) if persona_factor else (),
-                    now=now,
+                    now=reply_now,
                 )
             except DeepSeekWebSearchError:
                 logger.exception("DeepSeek 联网回答失败")

@@ -4,7 +4,7 @@
 
 - 项目名 `qqrobottext`，Python 3.10+。NapCat OneBot v11 正向 WebSocket 接收 QQ 群事件，本项目负责状态、意愿决策和调度，DeepSeek 负责聊天、低频知识提炼及联网搜索。
 - 当前主分支已经把回复意愿拆到 `src/reply_willingness.py`；`src/bot.py` 不应再次出现一套平行概率公式。
-- 群聊回答在 `WEB_SEARCH_ENABLED=true` 时优先使用 Responses API；普通稳定知识请求使用 `tool_choice=auto`，明确联网或天气、新闻、最新版本、行情、比分、非本地时间等明显实时问题强制 `web_search`。Responses 连续缺少联网证据时，默认使用同一 Key 切换 DeepSeek Anthropic `/messages` 的 `web_search_20250305`；本地时间问题直接用传入的带时区时钟回答。
+- 群聊回答在 `WEB_SEARCH_ENABLED=true` 时优先使用 Responses API；普通稳定知识请求使用 `tool_choice=auto`，明确联网或天气、新闻、最新版本、行情、比分、非本地时间等明显实时问题强制 `web_search`。Responses 连续缺少联网证据时，默认使用同一 Key 切换 DeepSeek Anthropic `/messages` 的 `web_search_20250305`；每个逻辑回复只读取一次电脑本地带时区时钟并由全部聊天与重试路径复用，本地时间问题直接用该时钟回答。此时钟不得改用 `BOT_TIMEZONE` 业务时钟。
 - 群聊 Chat Completions/Responses 的默认输出上限由 `DEEPSEEK_MAX_TOKENS=4096` 控制；话题联网丰富当前也使用 `max_output_tokens=4096`，避免搜索和思考 token 挤占最终 JSON。未来事项、人格和话题本地提取仍使用各自的结构化 JSON 额度与安全重试，不要误绑到聊天额度。
 - 自动测试使用临时 SQLite、模拟 WebSocket 和模拟 DeepSeek，绝不连接真实 QQ 或消耗 API 额度。
 - 开始工作前先执行 `git fetch origin` 并检查当前分支、远端头和工作区，不要假定提交状态。
