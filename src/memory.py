@@ -256,6 +256,8 @@ class MemoryStore:
                 scene TEXT NOT NULL,
                 frequency INTEGER NOT NULL DEFAULT 0,
                 confidence REAL NOT NULL DEFAULT 0,
+                intent TEXT NOT NULL DEFAULT 'other',
+                keywords_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (user_id, version, phrase, scene),
                 FOREIGN KEY (user_id, version)
                     REFERENCES persona_profile_versions(user_id, version)
@@ -269,6 +271,15 @@ class MemoryStore:
                 scene TEXT NOT NULL,
                 situation TEXT NOT NULL DEFAULT '',
                 response TEXT NOT NULL,
+                intent TEXT NOT NULL DEFAULT 'other',
+                emotion TEXT NOT NULL DEFAULT 'neutral',
+                keywords_json TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                quality_score REAL NOT NULL DEFAULT 0,
+                response_length INTEGER NOT NULL DEFAULT 0,
+                punctuation_json TEXT NOT NULL DEFAULT '{}',
+                source_at REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, version, exemplar_order),
                 FOREIGN KEY (user_id, version)
                     REFERENCES persona_profile_versions(user_id, version)
@@ -290,6 +301,28 @@ class MemoryStore:
                 completed INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, conversation_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_evaluations (
+                evaluation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL,
+                baseline_version INTEGER NOT NULL DEFAULT 0,
+                evaluated_at REAL NOT NULL,
+                sample_count INTEGER NOT NULL,
+                candidate_wins INTEGER NOT NULL,
+                baseline_wins INTEGER NOT NULL,
+                ties INTEGER NOT NULL,
+                neither_count INTEGER NOT NULL,
+                candidate_preference_rate REAL NOT NULL,
+                safety_failures INTEGER NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                passed INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS persona_activation_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -320,6 +353,31 @@ class MemoryStore:
             self.conn.execute(
                 "ALTER TABLE persona_collection_state ADD COLUMN processed_hashes_json TEXT NOT NULL DEFAULT '[]'"
             )
+        phrase_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(persona_phrases)")
+        }
+        for name, definition in (
+            ("intent", "TEXT NOT NULL DEFAULT 'other'"),
+            ("keywords_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ):
+            if name not in phrase_columns:
+                self.conn.execute(f"ALTER TABLE persona_phrases ADD COLUMN {name} {definition}")
+        exemplar_columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(persona_exemplars)")
+        }
+        for name, definition in (
+            ("intent", "TEXT NOT NULL DEFAULT 'other'"),
+            ("emotion", "TEXT NOT NULL DEFAULT 'neutral'"),
+            ("keywords_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("confidence", "REAL NOT NULL DEFAULT 0"),
+            ("evidence_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("quality_score", "REAL NOT NULL DEFAULT 0"),
+            ("response_length", "INTEGER NOT NULL DEFAULT 0"),
+            ("punctuation_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("source_at", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if name not in exemplar_columns:
+                self.conn.execute(f"ALTER TABLE persona_exemplars ADD COLUMN {name} {definition}")
         self.conn.commit()
 
     @staticmethod
@@ -985,18 +1043,31 @@ class MemoryStore:
                         "scene": item["scene"],
                         "frequency": item["frequency"],
                         "confidence": item["confidence"],
+                        "intent": item["intent"],
+                        "keywords": json.loads(item["keywords_json"] or "[]"),
                     }
                     for item in self.conn.execute(
-                        """SELECT phrase, scene, frequency, confidence
+                        """SELECT phrase, scene, frequency, confidence, intent, keywords_json
                            FROM persona_phrases WHERE user_id=? AND version=?
                            ORDER BY frequency DESC, phrase""",
                         (str(user_id), selected_version),
                     )
                 ]
                 profile["exemplars"] = [
-                    dict(item)
+                    {
+                        **{
+                            key: value
+                            for key, value in dict(item).items()
+                            if key not in {"keywords_json", "punctuation_json"}
+                        },
+                        "keywords": json.loads(item["keywords_json"] or "[]"),
+                        "punctuation": json.loads(item["punctuation_json"] or "{}"),
+                    }
                     for item in self.conn.execute(
-                        """SELECT situation, response, scene FROM persona_exemplars
+                        """SELECT situation, response, scene, intent, emotion,
+                                  keywords_json, confidence, evidence_count, quality_score,
+                                  response_length, punctuation_json, source_at
+                           FROM persona_exemplars
                            WHERE user_id=? AND version=? ORDER BY exemplar_order""",
                         (str(user_id), selected_version),
                     )
@@ -1047,7 +1118,11 @@ class MemoryStore:
         )[:1000]
         if not summary:
             raise ValueError("人格画像 summary 不能为空")
-        source_at = float(profile.get("last_source_message_at") or updated_at)
+        source_at = float(
+            profile.get("last_source_message_at")
+            or profile.get("source_ended_at")
+            or updated_at
+        )
         with self.conn:
             existing = self.conn.execute(
                 """SELECT version, active_version, summary, interests
@@ -1134,8 +1209,9 @@ class MemoryStore:
             phrases = [item for item in profile.get("phrases") or [] if isinstance(item, dict)]
             self.conn.executemany(
                 """INSERT INTO persona_phrases
-                       (user_id, version, phrase, scene, frequency, confidence)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                       (user_id, version, phrase, scene, frequency, confidence,
+                        intent, keywords_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
@@ -1144,6 +1220,8 @@ class MemoryStore:
                         str(item.get("scene") or "all")[:16],
                         max(0, int(item.get("frequency") or 0)),
                         min(1.0, max(0.0, float(item.get("confidence") or 0))),
+                        str(item.get("intent") or "other")[:16],
+                        json.dumps(item.get("keywords") or [], ensure_ascii=False),
                     )
                     for item in phrases
                     if item.get("text")
@@ -1152,8 +1230,10 @@ class MemoryStore:
             exemplars = [item for item in profile.get("exemplars") or [] if isinstance(item, dict)]
             self.conn.executemany(
                 """INSERT INTO persona_exemplars
-                       (user_id, version, exemplar_order, scene, situation, response)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                       (user_id, version, exemplar_order, scene, situation, response,
+                        intent, emotion, keywords_json, confidence, evidence_count,
+                        quality_score, response_length, punctuation_json, source_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
@@ -1162,6 +1242,15 @@ class MemoryStore:
                         str(item.get("scene") or "group")[:16],
                         " ".join(str(item.get("situation") or "").split())[:80],
                         " ".join(str(item.get("response") or "").split())[:100],
+                        str(item.get("intent") or "other")[:16],
+                        str(item.get("emotion") or "neutral")[:16],
+                        json.dumps(item.get("keywords") or [], ensure_ascii=False),
+                        min(1.0, max(0.0, float(item.get("confidence") or 0))),
+                        max(0, int(item.get("evidence_count") or 0)),
+                        min(1.0, max(0.0, float(item.get("quality_score") or 0))),
+                        max(0, int(item.get("response_length") or 0)),
+                        json.dumps(item.get("punctuation") or {}, sort_keys=True),
+                        max(0.0, float(item.get("source_at") or 0)),
                     )
                     for index, item in enumerate(exemplars[:200])
                     if item.get("response")
@@ -1193,7 +1282,71 @@ class MemoryStore:
             )
         ]
 
-    def activate_persona_version(self, user_id: str, version: int) -> None:
+    def get_latest_persona_profile(self, user_id: str, fallback: str = "") -> dict:
+        """读取最新版本作为草稿合并基线，不改变线上激活版本。"""
+        row = self.conn.execute(
+            "SELECT MAX(version) AS version FROM persona_profile_versions WHERE user_id=?",
+            (str(user_id),),
+        ).fetchone()
+        version = int(row["version"] or 0) if row else 0
+        return self.get_persona_profile(user_id, fallback, version=version or None)
+
+    def save_persona_evaluation(self, user_id: str, result: dict) -> int:
+        """只保存评测汇总，调用方不得传入对话或候选正文。"""
+        raw_metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+        allowed_metrics = {}
+        for key in ("candidate_style_distance", "baseline_style_distance"):
+            try:
+                allowed_metrics[key] = float(raw_metrics[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+        with self.conn:
+            cursor = self.conn.execute(
+                """INSERT INTO persona_evaluations
+                       (version, baseline_version, evaluated_at, sample_count,
+                        candidate_wins, baseline_wins, ties, neither_count,
+                        candidate_preference_rate, safety_failures, metrics_json, passed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    int(result["version"]),
+                    int(result.get("baseline_version") or 0),
+                    float(result["evaluated_at"]),
+                    max(0, int(result.get("sample_count") or 0)),
+                    max(0, int(result.get("candidate_wins") or 0)),
+                    max(0, int(result.get("baseline_wins") or 0)),
+                    max(0, int(result.get("ties") or 0)),
+                    max(0, int(result.get("neither_count") or 0)),
+                    min(1.0, max(0.0, float(result.get("candidate_preference_rate") or 0))),
+                    max(0, int(result.get("safety_failures") or 0)),
+                    json.dumps(allowed_metrics, ensure_ascii=False, sort_keys=True),
+                    int(bool(result.get("passed"))),
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def get_latest_persona_evaluation(self, user_id: str, version: int) -> dict:
+        row = self.conn.execute(
+            """SELECT * FROM persona_evaluations
+               WHERE version=? ORDER BY evaluation_id DESC LIMIT 1""",
+            (int(version),),
+        ).fetchone()
+        if not row:
+            return {}
+        result = dict(row)
+        result["passed"] = bool(result["passed"])
+        result["metrics"] = json.loads(result.pop("metrics_json") or "{}")
+        return result
+
+    def activate_persona_version(
+        self,
+        user_id: str,
+        version: int,
+        *,
+        require_passed_evaluation: bool = False,
+        force: bool = False,
+        reason: str = "",
+        activated_at: float = 0,
+    ) -> None:
         """原子激活指定版本，并同步意愿算法使用的相关性向量。"""
         uid = str(user_id)
         row = self.conn.execute(
@@ -1202,6 +1355,11 @@ class MemoryStore:
         ).fetchone()
         if not row:
             raise ValueError(f"人格版本不存在：{version}")
+        if force and not str(reason).strip():
+            raise ValueError("强制激活必须提供非空原因")
+        evaluation = self.get_latest_persona_evaluation(uid, int(version))
+        if require_passed_evaluation and not force and not evaluation.get("passed"):
+            raise ValueError("人格版本尚未通过留出评测；如需应急激活请使用 --force --reason")
         with self.conn:
             self.conn.execute(
                 "UPDATE persona_profile_versions SET status='archived' WHERE user_id=? AND status='active'",
@@ -1224,6 +1382,12 @@ class MemoryStore:
                 "INSERT INTO willingness_persona_features(user_id, feature_id, value) VALUES (?, ?, ?)",
                 [(uid, feature_id, value) for feature_id, value in vector.items()],
             )
+            if force:
+                self.conn.execute(
+                    """INSERT INTO persona_activation_events(version, reason)
+                       VALUES (?, ?)""",
+                    (int(version), " ".join(str(reason).split())[:240]),
+                )
 
     def rollback_persona_version(self, user_id: str) -> int:
         """回退到当前激活版本之前最近的版本。"""
@@ -1247,6 +1411,22 @@ class MemoryStore:
         """按用户删除画像、派生样例和采集断点；不影响其他机器人记忆。"""
         uid = str(user_id)
         with self.conn:
+            versions = [
+                int(row["version"])
+                for row in self.conn.execute(
+                    "SELECT version FROM persona_profile_versions WHERE user_id=?", (uid,)
+                )
+            ]
+            if versions:
+                placeholders = ",".join("?" for _ in versions)
+                self.conn.execute(
+                    f"DELETE FROM persona_evaluations WHERE version IN ({placeholders})",
+                    versions,
+                )
+                self.conn.execute(
+                    f"DELETE FROM persona_activation_events WHERE version IN ({placeholders})",
+                    versions,
+                )
             self.conn.execute("DELETE FROM persona_collection_state WHERE user_id=?", (uid,))
             self.conn.execute("DELETE FROM willingness_personas WHERE user_id=?", (uid,))
 

@@ -31,6 +31,7 @@ if __package__:
     from .memory import MemoryStore
     from .persona import (
         ContentFactor,
+        PERSONA_DIMENSION_ANCHORS,
         PersonaContentEngine,
         PersonaSample,
         normalize_persona_analysis,
@@ -38,6 +39,7 @@ if __package__:
         sanitize_public_metadata,
         sanitize_samples,
     )
+    from .persona_notification import notify_persona_draft
     from .reply_willingness import (
         ReplyWillingnessEngine,
         StreamMessage,
@@ -53,6 +55,7 @@ else:  # 支持 README 中的 `python src\bot.py` 直接启动方式。
     from memory import MemoryStore
     from persona import (
         ContentFactor,
+        PERSONA_DIMENSION_ANCHORS,
         PersonaContentEngine,
         PersonaSample,
         normalize_persona_analysis,
@@ -60,6 +63,7 @@ else:  # 支持 README 中的 `python src\bot.py` 直接启动方式。
         sanitize_public_metadata,
         sanitize_samples,
     )
+    from persona_notification import notify_persona_draft
     from reply_willingness import (
         ReplyWillingnessEngine,
         StreamMessage,
@@ -351,6 +355,7 @@ class BotConfig:
     persona_increment_min_messages: int = 50
     persona_increment_max_hours: float = 24.0
     persona_increment_floor_messages: int = 10
+    persona_draft_notifications_enabled: bool = True
     willingness_history_days: int = 30
     willingness_history_message_limit: int = 2000
     willingness_history_scan_limit: int = 10_000
@@ -557,6 +562,9 @@ class BotConfig:
             persona_increment_min_messages=persona_increment_min,
             persona_increment_max_hours=persona_increment_max_hours,
             persona_increment_floor_messages=persona_increment_floor,
+            persona_draft_notifications_enabled=_env_bool(
+                "PERSONA_DRAFT_NOTIFICATIONS_ENABLED", True
+            ),
             willingness_history_days=_env_int(
                 "WILLINGNESS_HISTORY_DAYS", 30, minimum=1, maximum=30
             ),
@@ -714,6 +722,7 @@ class BotConfig:
             persona_increment_max_hours=self.persona_increment_max_hours,
             persona_increment_floor_messages=self.persona_increment_floor_messages,
             persona_group_style_weight=self.persona_group_style_weight,
+            persona_draft_notifications_enabled=self.persona_draft_notifications_enabled,
             bond_inbound_rate=self.willingness_bond_inbound_rate,
             bond_outbound_rate=self.willingness_bond_outbound_rate,
             bond_grace_hours=self.willingness_bond_grace_hours,
@@ -824,6 +833,7 @@ class DeepSeekClient:
         context: str = "",
         content_factors: Sequence[ContentFactor] = (),
         now: datetime | None = None,
+        disable_thinking: bool = False,
     ) -> str:
         # 先在本地识别直接覆盖请求，避免攻击文本影响联网选择或模型运行逻辑。
         decision = self.conversation_requirements.classify_request(user_text)
@@ -862,7 +872,11 @@ class DeepSeekClient:
             except Exception as exc:  # noqa: BLE001
                 raise DeepSeekWebSearchError(str(exc)) from exc
         answer = await self._chat_completion(
-            history, user_text, context=context, content_factors=all_factors
+            history,
+            user_text,
+            context=context,
+            content_factors=all_factors,
+            disable_thinking=disable_thinking,
         )
         return await self._enforce_reply_requirements(answer, all_factors)
 
@@ -1415,10 +1429,17 @@ class DeepSeekClient:
             '"scene":"all|group|private","score":0.0,"description":"可执行风格描述",'
             '"confidence":0.0,"evidence_count":1}],'
             '"phrases":[{"text":"不超过40字且至少出现3次的非敏感短语",'
-            '"scene":"all|group|private","frequency":3,"confidence":0.0}],'
+            '"scene":"all|group|private","frequency":3,"confidence":0.0,'
+            '"intent":"answer|joke|comfort|disagree|question|revive|comment|other",'
+            '"keywords":["脱敏场景词"]}],'
             '"exemplars":[{"situation":"匿名场景","response":"不超过100字的脱敏表达",'
-            '"scene":"group|private"}]}。'
-            "score 和 confidence 必须在 0 到 1。私聊只提取风格，不保留具体事实。\n"
+            '"scene":"group|private","intent":"answer|joke|comfort|disagree|question|revive|comment|other",'
+            '"emotion":"calm|positive|caring|impatient|surprised|negative|neutral",'
+            '"keywords":["至多8个脱敏场景词"],"confidence":0.0,"evidence_count":1,'
+            '"quality_score":0.0,"response_length":1}]}。'
+            "score、confidence 和 quality_score 必须在 0 到 1。人格维度数值方向固定为："
+            f"{json.dumps(PERSONA_DIMENSION_ANCHORS, ensure_ascii=False)}。"
+            "私聊只提取风格，不保留具体事实。\n"
             f"默认背景种子：{' '.join(seed_background.split())[:1000]}\n"
             f"允许使用的公开资料：{json.dumps(sanitize_public_metadata(public_metadata), ensure_ascii=False)}\n"
             f"脱敏样本：{json.dumps(compact, ensure_ascii=False)}\n分析时刻：{now}"
@@ -1426,6 +1447,19 @@ class DeepSeekClient:
         decoded = normalize_persona_analysis(
             await self._json_completion(prompt, max_tokens=2048)
         )
+        # 回复后的消息绝不进入画像生成请求，只在本地作为“是否有人继续互动”的
+        # 弱代表性信号。模型没有机会把未来内容当成回复条件或事实来源。
+        outcome_signals = {
+            " ".join(str(sample.response).split())[:500]: (
+                0.5 + 0.5 * min(1.0, len(" ".join(str(sample.outcome).split())) / 40)
+            )
+            for sample in samples
+            if sample.response and sample.outcome
+        }
+        for exemplar in decoded["exemplars"]:
+            signal = outcome_signals.get(exemplar["response"])
+            if signal is not None:
+                exemplar["quality_score"] *= signal
         decoded.update(
             {
                 "last_source_message_at": max(included_times) if included_times else now,
@@ -1437,6 +1471,28 @@ class DeepSeekClient:
             }
         )
         return decoded
+
+    async def synthesize_persona_summary(
+        self, profiles: Sequence[dict], merged: dict
+    ) -> str:
+        """只使用派生画像综合稳定摘要；失败时由调用方保留确定性摘要。"""
+        compact = [
+            {
+                "summary": str(item.get("summary") or "")[:1000],
+                "interests": list(item.get("interests") or [])[:20],
+                "dimensions": list(item.get("dimensions") or [])[:20],
+            }
+            for item in profiles
+        ]
+        prompt = (
+            "把这些不含身份的人格派生画像综合成一个稳定、简洁、可执行的中文表达风格摘要。"
+            "不得加入人物身份、具体经历、第三方资料或新事实。只返回 JSON："
+            '{"summary":"不超过1000字"}。\n'
+            + json.dumps(compact, ensure_ascii=False)
+        )
+        decoded = await self._json_completion(prompt, max_tokens=1024)
+        summary = " ".join(str(decoded.get("summary") or "").split())[:1000]
+        return summary or str(merged.get("summary") or "")[:1000]
 
     async def _json_completion(self, prompt: str, *, max_tokens: int) -> dict:
         """执行可恢复的严格 JSON 请求，供低频知识与人格分析复用。"""
@@ -1939,7 +1995,7 @@ class QQBot:
         ):
             logger.warning(
                 "尚无已激活的结构化人格版本，回答暂时使用通用后备背景；"
-                "请先完成离线盲测并运行 persona_collector.py activate。"
+                "请先运行 persona_collector.py evaluate 完成留出评测再激活。"
             )
         try:
             while True:
@@ -2173,7 +2229,9 @@ class QQBot:
             context = self._build_group_context(
                 group_id, user_id, extract_mentioned_ids(payload, self_id), question, now
             )
-            persona_factor = self.persona.build_factor()
+            persona_factor = self.persona.build_factor(
+                query=question, history=history, scene="group"
+            )
             try:
                 answer = await self.llm_client.chat(
                     history,
@@ -2669,6 +2727,11 @@ class QQBot:
                     "人格兼容冷启动草稿 v%s 已生成（%s 条本人消息），激活前不影响线上",
                     version,
                     len(target_messages),
+                )
+                notify_persona_draft(
+                    version,
+                    len(target_messages),
+                    enabled=self.config.persona_draft_notifications_enabled,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("意愿模块个人背景首次生成失败，将使用本地种子背景")

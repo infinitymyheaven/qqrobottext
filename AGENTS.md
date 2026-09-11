@@ -15,8 +15,9 @@
 - `src/reply_willingness.py`：每群消息流、五秒环境快照、八参数概率、实时决策日志、关系变化、话题/个人背景分析调度。
 - `src/conversation_requirements.py`：第二内容指标、直接覆盖请求分类、最高优先级约束因子、输出校验与最小清理。
 - `src/message_delivery.py`：第三内容指标、短回复分句、每日剩余额度收敛和打字延迟规划。
-- `src/persona.py`：统一的 `ContentFactor` 接口、结构化人格 schema、隐私清洗、批次合并和在线人格指导块。
-- `src/persona_collector.py`：第二 NapCat 本机交互采集、断点、版本列表/盲测/激活/回退/删除；绝不处理 QQ 密码。
+- `src/persona.py`：统一的 `ContentFactor` 接口、结构化人格 schema、隐私清洗、时间衰减合并和本地混合检索。
+- `src/persona_collector.py`：第二 NapCat 本机交互采集、断点、真实留出评测、版本门禁/回退/删除；绝不处理 QQ 密码。
+- `src/persona_notification.py`：草稿 Windows Toast 与无 `shell` 的可见 PowerShell 评测启动器。
 - `src/memory.py`：SQLite 建表/无损迁移、成员资料、未来事项、活动、话题知识、个人背景、关系和每日算法回复数。
 - `src/error_logging.py`：内存环形状态缓冲；只有 ERROR 才把有限前后文写入 `logs/error_context.txt`。
 - `tests/test_reply_willingness.py`：消息流、八参数、日志安全、额度、冷却、遗忘曲线、话题层级和分析间隔。
@@ -90,7 +91,10 @@ will_reply = random_draw < probability
 - `PERSONA_USER_ID` 是通用配置；旧 `WILLINGNESS_PERSONA_USER_ID` 只作为兼容别名，两者不一致必须报错。常驻冷启动仍尽力读取共同群历史；独立采集器默认 90 天/20000 条并要求用户选择会话。
 - 独立采集器先验证 `get_login_info`，原文只存在于内存页；参与者、账号、手机号、邮箱和 URL 在调用 DeepSeek 前脱敏。SQLite 只能保存结构化特征、短脱敏样例、覆盖统计和派生断点。
 - 人格、话题等 JSON 提炼必须在 Chat Completions 中显式关闭思考模式；空 `content` 或截断 JSON 最多安全重试三次并逐次提高输出额度，诊断不得记录提示或模型原文。
-- 采集器产生 `draft`，只有显式激活的版本可进入线上回答。群聊风格权重默认 0.70，私聊为 0.30；普通群实时增量达到 50 条立即更新，或满 24 小时且至少 10 条时更新。
+- 采集器和在线增量只产生 `draft`，只有通过留出评测后显式激活的版本可进入线上回答；应急强制激活必须记录非空原因。群聊风格权重默认 0.70，私聊为 0.30；普通群实时增量达到 50 条立即更新，或满 24 小时且至少 10 条时更新。连续草稿以最新草稿为合并基线，线上仍只读取激活版。
+- 人格回复样本的生成条件只含回复前最多三条同会话语境；回复后的第一条消息只作内存效果参考。历史分页必须携带前一页边界语境，SQLite 不保存原始或完整脱敏对话。
+- 在线人格样例使用当前问题和最近三轮的本地文本相关度与 MMR 检索，最多 4 个样例、6 个场景维度和 4 个匹配短语；低置信度不得注入无关样例、兴趣或短语。
+- `evaluate VERSION` 只使用严格晚于候选 `source_ended_at` 的第二 NapCat 消息。评测至少 10 条且至少 10 个明确 A/B 选择，候选胜率达到 55%、安全失败为零才通过；只保存汇总，不保存上下文、参考回复或候选正文。
 - 每次 AI 回答通过独立 `ContentFactor` 注入人格，不能重新塞回 `_build_group_context()` 的事实资料。两条 DeepSeek 聊天路径必须共用因子，联网路径不得把因子内容写入搜索词。
 - 机器人平时不主动声明身份，但不得冒充模板账号、代替本人表态、泄露资料或恢复“主人/服从”设定。
 - 群友 `@` 或引用机器人时关系向 1 靠近 12%；机器人成功回复时向 1 靠近 8%。一天内不衰减，之后按指数遗忘，在约第 30 天或低于 0.01 时归零。
@@ -98,7 +102,7 @@ will_reply = random_draw < probability
 
 ## 6. SQLite 与消息上下文
 
-默认数据库 `data/bot_memory.sqlite3`。除原有长期表外，人格使用 `persona_profile_versions`、`persona_style_dimensions`、`persona_phrases`、`persona_exemplars` 和 `persona_collection_state`；原始聊天不得写入这些表。
+默认数据库 `data/bot_memory.sqlite3`。除原有长期表外，人格使用 `persona_profile_versions`、`persona_style_dimensions`、`persona_phrases`、`persona_exemplars`、`persona_collection_state`、`persona_evaluations` 和 `persona_activation_events`；原始聊天不得写入这些表。
 
 - `_create_schema()` 只能用 `CREATE TABLE IF NOT EXISTS` 和 `PRAGMA table_info + ALTER TABLE` 无损升级，绝不重建、清空或删除用户数据库。
 - `bot_activity.algorithm_reply_count` 按 `(group_id, local_date)` 持久化并跨日隔离。

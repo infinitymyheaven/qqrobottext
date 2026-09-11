@@ -13,14 +13,16 @@ import logging
 import math
 import re
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Iterable
 
 if __package__:
-    from .persona import merge_persona_profiles
+    from .persona import PersonaSample, merge_persona_profiles, redact_persona_text
+    from .persona_notification import notify_persona_draft
 else:
-    from persona import merge_persona_profiles
+    from persona import PersonaSample, merge_persona_profiles, redact_persona_text
+    from persona_notification import notify_persona_draft
 
 
 logger = logging.getLogger("qqrobot")
@@ -125,6 +127,7 @@ class WillingnessConfig:
     persona_increment_max_hours: float = 24.0
     persona_increment_floor_messages: int = 10
     persona_group_style_weight: float = 0.70
+    persona_draft_notifications_enabled: bool = True
     bond_inbound_rate: float = 0.12
     bond_outbound_rate: float = 0.08
     bond_grace_hours: float = 24.0
@@ -231,7 +234,8 @@ class ReplyWillingnessEngine:
         self.rng = rng
         self._messages: defaultdict[str, deque[StreamMessage]] = defaultdict(deque)
         # 人格增量需要跨越三小时意愿窗口；单独队列最多保留两倍最长更新周期。
-        self._persona_pending: deque[StreamMessage] = deque()
+        self._persona_pending: deque[PersonaSample] = deque()
+        self._persona_last_sample_by_group: dict[str, PersonaSample] = {}
         self._snapshots: dict[str, EnvironmentSnapshot] = {}
         self._last_bot_reply_at: dict[str, float] = {}
         self._analysis_running: set[str] = set()
@@ -246,20 +250,54 @@ class ReplyWillingnessEngine:
         else:
             queue.append(message)
         self._prune_group(message.group_id, message.sent_at)
+        pending_outcome = self._persona_last_sample_by_group.get(message.group_id)
+        if pending_outcome and message.text and not message.is_bot:
+            try:
+                pending_index = self._persona_pending.index(pending_outcome)
+            except ValueError:
+                self._persona_last_sample_by_group.pop(message.group_id, None)
+            else:
+                updated = replace(
+                    pending_outcome, outcome=redact_persona_text(message.text)
+                )
+                self._persona_pending[pending_index] = updated
+                self._persona_last_sample_by_group.pop(message.group_id, None)
         if (
             self.config.persona_user_id
             and message.user_id == self.config.persona_user_id
             and message.text
             and not message.is_bot
         ):
-            if self._persona_pending and message.sent_at < self._persona_pending[-1].sent_at:
+            previous = [
+                item
+                for item in queue
+                if item is not message and item.sent_at <= message.sent_at
+            ][-3:]
+            aliases: dict[str, str] = {}
+            context_lines: list[str] = []
+            for item in previous:
+                label = (
+                    "模板用户"
+                    if item.user_id == self.config.persona_user_id
+                    else aliases.setdefault(item.user_id, f"成员{len(aliases) + 1}")
+                )
+                if item.text:
+                    context_lines.append(f"{label}：{redact_persona_text(item.text)}")
+            sample = PersonaSample(
+                context="\n".join(context_lines),
+                response=redact_persona_text(message.text),
+                scene="group",
+                sent_at=message.sent_at,
+            )
+            if self._persona_pending and sample.sent_at < self._persona_pending[-1].sent_at:
                 ordered_persona = sorted(
-                    (*self._persona_pending, message), key=lambda item: item.sent_at
+                    (*self._persona_pending, sample), key=lambda item: item.sent_at
                 )
                 self._persona_pending.clear()
                 self._persona_pending.extend(ordered_persona)
             else:
-                self._persona_pending.append(message)
+                self._persona_pending.append(sample)
+            self._persona_last_sample_by_group[message.group_id] = sample
             persona_cutoff = (
                 message.sent_at - self.config.persona_increment_max_hours * 7200
             )
@@ -766,8 +804,11 @@ class ReplyWillingnessEngine:
             persona_state = self.store.get_persona_profile(
                 self.config.persona_user_id, self.config.personal_background
             )
-            processed_at = float(persona_state.get("last_source_message_at") or 0)
-            profile_updated_at = float(persona_state.get("updated_at") or 0)
+            merge_base = self.store.get_latest_persona_profile(
+                self.config.persona_user_id, self.config.personal_background
+            )
+            processed_at = float(merge_base.get("last_source_message_at") or 0)
+            profile_updated_at = float(merge_base.get("updated_at") or 0)
             # 使用人格专属队列而不是三小时群流，低活跃时也能满足 24 小时更新策略。
             persona_items = sorted(
                 (item for item in self._persona_pending if item.sent_at > processed_at),
@@ -783,26 +824,45 @@ class ReplyWillingnessEngine:
                 try:
                     # 单批最多 200 条，确保不会因模型上下文上限跳过后仍错误推进游标。
                     analysis_items = persona_items[:200]
-                    profile = await analyzer.analyze_persona(
-                        [item.text for item in analysis_items],
-                        {},
-                        self.config.personal_background,
-                        now,
-                    )
-                    # 已激活的结构化画像作为历史证据参与合并；少量新消息不会覆盖旧人格。
-                    if persona_state.get("active_version") and persona_state.get("dimensions"):
+                    if hasattr(analyzer, "analyze_persona_samples"):
+                        incremental_profile = await analyzer.analyze_persona_samples(
+                            analysis_items,
+                            public_metadata={},
+                            seed_background=self.config.personal_background,
+                            now=now,
+                        )
+                    else:  # 兼容只实现旧增量接口的分析器。
+                        incremental_profile = await analyzer.analyze_persona(
+                            [item.response for item in analysis_items],
+                            {},
+                            self.config.personal_background,
+                            now,
+                        )
+                    # 最新草稿累积尚未激活的证据；线上回答仍只读取 active_version。
+                    profile = incremental_profile
+                    if merge_base.get("version"):
                         profile = merge_persona_profiles(
-                            [persona_state, profile],
+                            [merge_base, incremental_profile],
                             group_weight=self.config.persona_group_style_weight,
                         )
+                        try:
+                            profile["summary"] = await analyzer.synthesize_persona_summary(
+                                [merge_base, incremental_profile], profile
+                            )
+                        except Exception:  # noqa: BLE001 - 确定性摘要可安全降级。
+                            logger.warning("人格摘要综合失败，保留确定性合并摘要")
                     # 存储层使用真实最新源消息时间，而不是信任模型生成游标。
                     profile["last_source_message_at"] = analysis_items[-1].sent_at
-                    self.store.save_persona_version(
+                    version = self.store.save_persona_version(
                         self.config.persona_user_id,
                         profile,
                         now,
-                        # 已有经确认版本时才自动激活渐进更新；首次画像保持草稿。
-                        activate=bool(persona_state.get("active_version")),
+                        activate=False,
+                    )
+                    notify_persona_draft(
+                        version,
+                        len(analysis_items),
+                        enabled=self.config.persona_draft_notifications_enabled,
                     )
                     processed_at = analysis_items[-1].sent_at
                     while self._persona_pending and self._persona_pending[0].sent_at <= processed_at:

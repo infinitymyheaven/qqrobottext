@@ -61,6 +61,24 @@ class ReplyWillingnessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.message_id for item in messages], ["1", "2", "4"])
         self.assertEqual([item.sent_at for item in messages], sorted(item.sent_at for item in messages))
 
+    def test_persona_increment_context_and_outcome_stay_within_the_same_group(self):
+        engine = ReplyWillingnessEngine(
+            WillingnessConfig(persona_user_id="target"),
+            self.store,
+            rng=SequenceRNG(),
+        )
+        engine.record_message(StreamMessage("g1", "a", "甲", self.now, "同群前文"))
+        engine.record_message(StreamMessage("g2", "b", "乙", self.now + 1, "跨群秘密"))
+        engine.record_message(
+            StreamMessage("g1", "target", "模板", self.now + 2, "模板回复")
+        )
+        sample = engine._persona_pending[-1]
+        self.assertIn("同群前文", sample.prior_context)
+        self.assertNotIn("跨群秘密", sample.prior_context)
+        self.assertEqual(sample.outcome, "")
+        engine.record_message(StreamMessage("g1", "c", "丙", self.now + 3, "后续反馈"))
+        self.assertEqual(engine._persona_pending[-1].outcome, "后续反馈")
+
     def test_snapshot_refreshes_at_five_seconds_and_short_density_dominates(self):
         for index in range(10):
             self.engine.record_message(self.message(index, 700))
@@ -227,6 +245,7 @@ class ReplyWillingnessTest(unittest.IsolatedAsyncioTestCase):
             persona_increment_min_messages=50,
             persona_increment_max_hours=24,
             persona_increment_floor_messages=2,
+            persona_draft_notifications_enabled=False,
         )
         self.store.save_persona_profile(
             "target",
@@ -262,9 +281,10 @@ class ReplyWillingnessTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.messages("g", self.now), ())
         await engine.analyze_due_groups(Analyzer(), self.now)
         self.assertEqual(calls, [["低频发言 0", "低频发言 1"]])
-        self.assertEqual(
-            self.store.get_persona_profile("target", "")["summary"], "低频但稳定"
-        )
+        self.assertEqual(self.store.get_persona_profile("target", "")["summary"], "旧人格")
+        latest = self.store.get_latest_persona_profile("target", "")
+        self.assertIn("旧人格", latest["summary"])
+        self.assertIn("低频但稳定", latest["summary"])
 
 
 if __name__ == "__main__":

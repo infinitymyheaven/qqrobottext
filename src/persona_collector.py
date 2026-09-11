@@ -40,6 +40,7 @@ if __package__:
         merge_persona_profiles,
         sanitize_samples,
     )
+    from .persona_notification import notify_persona_draft
 else:  # 支持 README 中的 `python src\persona_collector.py` 运行方式。
     from bot import (
         DEFAULT_DEEPSEEK_BASE_URL,
@@ -58,6 +59,7 @@ else:  # 支持 README 中的 `python src\persona_collector.py` 运行方式。
         merge_persona_profiles,
         sanitize_samples,
     )
+    from persona_notification import notify_persona_draft
 
 
 DEFAULT_HISTORY_DAYS = 90
@@ -213,6 +215,7 @@ def build_persona_samples(
     *,
     before: int = DEFAULT_CONTEXT_BEFORE,
     after: int = DEFAULT_CONTEXT_AFTER,
+    eligible_message_hashes: set[str] | None = None,
 ) -> list[PersonaSample]:
     """从同一会话按时间生成“有限上下文 → 本人回复”样本。"""
     ordered = sorted(messages, key=_message_time)
@@ -236,24 +239,33 @@ def build_persona_samples(
     for index, message in enumerate(ordered):
         if _message_user_id(message) != str(target_user_id):
             continue
+        if (
+            eligible_message_hashes is not None
+            and _message_identity_hash(message) not in eligible_message_hashes
+        ):
+            continue
         response = extract_message_text(message)
         if not response:
             continue
         context_parts: list[str] = []
         start = max(0, index - before)
-        end = min(len(ordered), index + after + 1)
-        for context_index in range(start, end):
-            if context_index == index:
-                continue
+        # 生成条件严格只含回复前消息；回复后的消息属于结果反馈，不能造成未来泄漏。
+        for context_index in range(start, index):
             text = extract_message_text(ordered[context_index])
             if text:
                 context_parts.append(f"{labels[context_index]}：{text}")
+        outcome = ""
+        for outcome_index in range(index + 1, min(len(ordered), index + after + 1)):
+            outcome = extract_message_text(ordered[outcome_index])
+            if outcome:
+                break
         samples.append(
             PersonaSample(
                 context="\n".join(context_parts),
                 response=response,
                 scene="private" if scene == "private" else "group",
                 sent_at=_message_time(message),
+                outcome=outcome,
             )
         )
     return sanitize_samples(samples, aliases)
@@ -319,18 +331,85 @@ async def collect_conversation(
     target_count = sum(int(item.get("source_message_count") or 0) for item in profiles)
     processed_hashes: set[str] = set(previous_state.get("processed_hashes") or [])
     gap = ""
+    deferred_page: list[dict] = []
+    fetch_cursor = cursor
+
+    async def process_page(page: list[dict], older_page: list[dict] | None = None) -> bool:
+        """提炼一张已确认的页；更早页只以内存边界参与语境。"""
+        nonlocal cursor, scanned, oldest_at, newest_at, target_count
+        page_hashes = {_message_identity_hash(item) for item in page}
+        eligible_hashes = {
+            _message_identity_hash(item)
+            for item in page
+            if not _message_time(item) or _message_time(item) >= cutoff
+        }
+        older_boundary = sorted(older_page or [], key=_message_time)[-DEFAULT_CONTEXT_BEFORE:]
+        samples = build_persona_samples(
+            [*older_boundary, *page],
+            target_user_id,
+            conversation.kind,
+            eligible_message_hashes=eligible_hashes,
+        )
+        samples = samples[: max(0, remaining - target_count)]
+        if samples:
+            profile = await llm.analyze_persona_samples(
+                samples,
+                public_metadata=public_metadata,
+                seed_background=seed_background,
+                now=time.time(),
+            )
+            profiles.append(profile)
+            target_count += len(samples)
+
+        processed_hashes.update(page_hashes)
+        scanned += len(page)
+        page_times = [value for value in map(_message_time, page) if value]
+        if page_times:
+            oldest_at = min([oldest_at, *page_times]) if oldest_at else min(page_times)
+            newest_at = max([newest_at, *page_times])
+        oldest_message = min(page, key=_message_time)
+        cursor = str(oldest_message.get("message_seq") or _message_id(oldest_message))
+        completed = bool(page_times and min(page_times) < cutoff)
+        merged = merge_persona_profiles(profiles) if profiles else {}
+        store.save_persona_collection_state(
+            target_user_id,
+            storage_key,
+            {
+                "conversation_type": conversation.kind,
+                "cursor": cursor,
+                "fingerprint": _page_fingerprint(page),
+                "oldest_at": oldest_at,
+                "newest_at": newest_at,
+                "scanned_count": scanned,
+                "processed_hashes": sorted(processed_hashes)[-50_000:],
+                "derived_profile": merged,
+                "completed": completed,
+                "updated_at": time.time(),
+            },
+        )
+        return completed
 
     for _page_number in range(200):
         if target_count >= remaining:
             gap = "达到本次目标消息上限"
             break
         if conversation.kind == "group":
-            params: dict = {"group_id": conversation.peer_id, "count": DEFAULT_PAGE_SIZE}
-            if cursor:
-                params["message_seq"] = cursor
+            params: dict = {
+                "group_id": conversation.peer_id,
+                "count": DEFAULT_PAGE_SIZE,
+                "disable_get_url": True,
+                "parse_mult_msg": False,
+            }
+            if fetch_cursor:
+                params["message_seq"] = fetch_cursor
             action = "get_group_msg_history"
         else:
-            params = {"user_id": conversation.peer_id, "count": DEFAULT_PAGE_SIZE}
+            params = {
+                "user_id": conversation.peer_id,
+                "count": DEFAULT_PAGE_SIZE,
+                "disable_get_url": True,
+                "parse_mult_msg": False,
+            }
             action = "get_friend_msg_history"
         try:
             page = _history_messages(await rpc.request(action, params))
@@ -348,51 +427,25 @@ async def collect_conversation(
             gap = "历史接口返回重复页，已停止回溯"
             break
         previous_fingerprint = fingerprint
-        for item in page:
-            processed_hashes.add(_message_identity_hash(item))
-        scanned += len(page)
-        page_times = [value for value in map(_message_time, page) if value]
-        if page_times:
-            oldest_at = min([oldest_at, *page_times]) if oldest_at else min(page_times)
-            newest_at = max([newest_at, *page_times])
-        eligible = [item for item in page if not _message_time(item) or _message_time(item) >= cutoff]
-        samples = build_persona_samples(eligible, target_user_id, conversation.kind)
-        samples = samples[: max(0, remaining - target_count)]
-        if samples:
-            profile = await llm.analyze_persona_samples(
-                samples,
-                public_metadata=public_metadata,
-                seed_background=seed_background,
-                now=time.time(),
-            )
-            profiles.append(profile)
-            target_count += len(samples)
-        merged = merge_persona_profiles(profiles) if profiles else {}
         oldest_message = min(page, key=_message_time)
-        cursor = str(oldest_message.get("message_seq") or _message_id(oldest_message))
-        completed = bool(page_times and min(page_times) < cutoff)
-        store.save_persona_collection_state(
-            target_user_id,
-            storage_key,
-            {
-                "conversation_type": conversation.kind,
-                "cursor": cursor,
-                "fingerprint": fingerprint,
-                "oldest_at": oldest_at,
-                "newest_at": newest_at,
-                "scanned_count": scanned,
-                "processed_hashes": sorted(processed_hashes)[-50_000:],
-                "derived_profile": merged,
-                "completed": completed,
-                "updated_at": time.time(),
-            },
-        )
-        if completed:
+        fetch_cursor = str(oldest_message.get("message_seq") or _message_id(oldest_message))
+        if deferred_page:
+            if await process_page(deferred_page, page):
+                deferred_page = []
+                break
+        deferred_page = page
+        page_times = [value for value in map(_message_time, page) if value]
+        if page_times and min(page_times) < cutoff:
+            await process_page(deferred_page)
+            deferred_page = []
             break
         # 当前 NapCat 私聊接口没有稳定的跨版本分页参数；重复请求只会泄漏成本。
         if conversation.kind == "private":
             gap = "私聊历史接口仅返回当前可用页"
             break
+
+    if deferred_page and target_count < remaining:
+        await process_page(deferred_page)
 
     merged = merge_persona_profiles(profiles) if profiles else None
     store.save_persona_collection_state(
@@ -506,6 +559,12 @@ async def collect_command(args) -> int:
             final_profile = merge_persona_profiles(
                 profiles, group_weight=args.group_weight
             )
+            try:
+                final_profile["summary"] = await llm.synthesize_persona_summary(
+                    profiles, final_profile
+                )
+            except Exception:  # noqa: BLE001 - 保留确定性摘要即可继续生成草稿。
+                print("人格摘要综合失败，已保留本地确定性摘要。", file=sys.stderr)
             # 真实会话名称只用于当前终端输出，不进入最终画像覆盖 JSON。
             stored_coverage = [
                 {key: value for key, value in report.items() if key != "display"}
@@ -531,7 +590,13 @@ async def collect_command(args) -> int:
                     f"- {item['display']}：扫描 {item['scanned']} 条，"
                     f"提炼 {item['target_messages']} 条，缺口：{item.get('gap') or '未发现'}"
                 )
-            print("请先运行 compare 盲测，再使用 activate 激活该版本。")
+            print(f"请运行 evaluate {version} 完成真实留出评测，再使用 activate 激活该版本。")
+            notify_persona_draft(
+                version,
+                int(final_profile.get("source_message_count") or 0),
+                enabled=(os.getenv("PERSONA_DRAFT_NOTIFICATIONS_ENABLED", "true").strip().casefold()
+                         not in {"0", "false", "no", "off"}),
+            )
             return 0
     finally:
         store.close()
@@ -558,7 +623,14 @@ def list_command(args) -> int:
 def activate_command(args) -> int:
     store = MemoryStore(args.database)
     try:
-        store.activate_persona_version(_persona_user_id(), args.version)
+        store.activate_persona_version(
+            _persona_user_id(),
+            args.version,
+            require_passed_evaluation=True,
+            force=bool(args.force),
+            reason=str(args.reason or ""),
+            activated_at=time.time(),
+        )
         print(f"人格版本 {args.version} 已激活；重启机器人后生效。")
         return 0
     finally:
@@ -660,6 +732,216 @@ async def compare_command(args) -> int:
         store.close()
 
 
+async def _evaluation_samples(
+    rpc: OneBotRPC,
+    conversations: list[Conversation],
+    target_user_id: str,
+    *,
+    source_ended_at: float,
+    limit: int,
+) -> list[PersonaSample]:
+    """临时读取严格晚于画像截止时间的样本；正文不会离开当前进程。"""
+    collected: list[PersonaSample] = []
+    for conversation_index, conversation in enumerate(conversations, 1):
+        rows: list[dict] = []
+        cursor = ""
+        seen: set[str] = set()
+        for _page in range(200):
+            params = {
+                "group_id" if conversation.kind == "group" else "user_id": conversation.peer_id,
+                "count": DEFAULT_PAGE_SIZE,
+                "disable_get_url": True,
+                "parse_mult_msg": False,
+            }
+            if cursor and conversation.kind == "group":
+                params["message_seq"] = cursor
+            action = (
+                "get_group_msg_history"
+                if conversation.kind == "group"
+                else "get_friend_msg_history"
+            )
+            try:
+                page = _history_messages(await rpc.request(action, params))
+            except OneBotActionError:
+                # NapCat 在本地没有缓存该会话历史时会把空列表包装成
+                # “消息 undefined 不存在”。单个空会话不应终止其他留出样本。
+                print(
+                    f"所选第 {conversation_index} 个会话没有可用的本地历史，已跳过。",
+                    file=sys.stderr,
+                )
+                break
+            new_page = [item for item in page if _message_identity_hash(item) not in seen]
+            if not new_page:
+                break
+            for item in new_page:
+                seen.add(_message_identity_hash(item))
+            rows.extend(new_page)
+            times = [value for value in map(_message_time, new_page) if value]
+            oldest = min(new_page, key=_message_time)
+            cursor = str(oldest.get("message_seq") or _message_id(oldest))
+            if conversation.kind == "private" or (times and min(times) <= source_ended_at):
+                break
+        samples = build_persona_samples(rows, target_user_id, conversation.kind)
+        collected.extend(item for item in samples if item.sent_at > source_ended_at)
+    return sorted(collected, key=lambda item: item.sent_at)[:limit]
+
+
+def _style_distance(reference: str, candidate: str) -> float:
+    """只返回可聚合的长度与标点距离，不持久化任何正文。"""
+    length_distance = abs(len(reference) - len(candidate)) / max(1, len(reference))
+    punctuation = "，。！？,.!?"
+    punctuation_distance = sum(
+        abs(reference.count(mark) - candidate.count(mark)) for mark in punctuation
+    ) / max(1, len(reference))
+    return min(2.0, length_distance + punctuation_distance)
+
+
+def _evaluation_passes(
+    *,
+    sample_count: int,
+    candidate_wins: int,
+    baseline_wins: int,
+    safety_failures: int,
+    min_samples: int,
+) -> tuple[bool, float]:
+    """应用固定人工门槛；平局和都不像不进入胜率分母。"""
+    decisive = max(0, int(candidate_wins)) + max(0, int(baseline_wins))
+    preference = max(0, int(candidate_wins)) / decisive if decisive else 0.0
+    passed = (
+        int(sample_count) >= int(min_samples)
+        and decisive >= 10
+        and preference >= 0.55
+        and int(safety_failures) == 0
+    )
+    return passed, preference
+
+
+async def evaluate_command(args) -> int:
+    target = _persona_user_id()
+    token = getpass.getpass("第二 NapCat WebSocket Token（留空表示未启用）：")
+    store = MemoryStore(args.database)
+    try:
+        candidate_profile = store.get_persona_profile(target, "", version=args.version)
+        if int(candidate_profile.get("version") or 0) != int(args.version):
+            raise ValueError(f"人格版本不存在：{args.version}")
+        source_ended_at = float(candidate_profile.get("source_ended_at") or 0)
+        if source_ended_at <= 0:
+            raise ValueError("候选画像缺少有效 source_ended_at，不能构造真实留出集")
+        baseline_profile = store.get_persona_profile(target, "")
+        baseline_version = int(baseline_profile.get("active_version") or 0)
+        async with websockets.connect(with_access_token(args.ws_url, token)) as ws:
+            rpc = OneBotRPC(ws)
+            login = await rpc.request("get_login_info", {}) or {}
+            if str((login or {}).get("user_id") or "") != target:
+                raise RuntimeError("当前第二 NapCat 登录账号与 PERSONA_USER_ID 不一致")
+            conversations = choose_conversations(await list_conversations(rpc))
+            samples = await _evaluation_samples(
+                rpc,
+                conversations,
+                target,
+                source_ended_at=source_ended_at,
+                limit=args.samples,
+            )
+        if len(samples) < args.min_samples:
+            raise RuntimeError(
+                f"画像截止时间之后只有 {len(samples)} 条可用样本，至少需要 {args.min_samples} 条"
+            )
+
+        llm = _deepseek_client(web_search_enabled=False)
+        engine = PersonaContentEngine(
+            store,
+            target,
+            os.getenv("WILLINGNESS_PERSONAL_BACKGROUND") or "自然、友好、有分寸",
+        )
+        rng = random.SystemRandom()
+        counts = {"candidate": 0, "baseline": 0, "tie": 0, "neither": 0}
+        candidate_distances: list[float] = []
+        baseline_distances: list[float] = []
+        safety_failures = 0
+        completed = 0
+        for index, sample in enumerate(samples, 1):
+            prompt = sample.context or "群聊里暂时没有更早的文字上下文，请自然接话。"
+            try:
+                baseline_factor = engine.build_factor(
+                    query=prompt, scene=sample.scene
+                )
+                candidate_factor = engine.build_factor(
+                    query=prompt, scene=sample.scene, version=args.version
+                )
+                baseline_answer = await llm.chat(
+                    [],
+                    prompt,
+                    content_factors=(baseline_factor,) if baseline_factor else (),
+                    disable_thinking=True,
+                )
+                candidate_answer = await llm.chat(
+                    [],
+                    prompt,
+                    content_factors=(candidate_factor,) if candidate_factor else (),
+                    disable_thinking=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - 单题失败计入安全门禁。
+                safety_failures += 1
+                print(f"第 {index} 题生成失败：{type(exc).__name__}", file=sys.stderr)
+                continue
+            candidate_is_a = bool(rng.randrange(2))
+            answer_a, answer_b = (
+                (candidate_answer, baseline_answer)
+                if candidate_is_a
+                else (baseline_answer, candidate_answer)
+            )
+            print(f"\n[{index}/{len(samples)}] 回复前语境：\n{sample.context or '无'}")
+            print(f"真实回复：{sample.response}\nA：{answer_a}\nB：{answer_b}")
+            while True:
+                choice = input("选择更像模板用户的回答 [A/B/T相同/N都不像]：").strip().casefold()
+                if choice in {"a", "b", "t", "n"}:
+                    break
+            if choice in {"a", "b"}:
+                chose_candidate = (choice == "a") == candidate_is_a
+                counts["candidate" if chose_candidate else "baseline"] += 1
+            elif choice == "t":
+                counts["tie"] += 1
+            else:
+                counts["neither"] += 1
+            candidate_distances.append(_style_distance(sample.response, candidate_answer))
+            baseline_distances.append(_style_distance(sample.response, baseline_answer))
+            completed += 1
+
+        passed, preference = _evaluation_passes(
+            sample_count=completed,
+            candidate_wins=counts["candidate"],
+            baseline_wins=counts["baseline"],
+            safety_failures=safety_failures,
+            min_samples=args.min_samples,
+        )
+        result = {
+            "version": int(args.version),
+            "baseline_version": baseline_version,
+            "evaluated_at": time.time(),
+            "sample_count": completed,
+            "candidate_wins": counts["candidate"],
+            "baseline_wins": counts["baseline"],
+            "ties": counts["tie"],
+            "neither_count": counts["neither"],
+            "candidate_preference_rate": preference,
+            "safety_failures": safety_failures,
+            "metrics": {
+                "candidate_style_distance": sum(candidate_distances) / len(candidate_distances) if candidate_distances else 0,
+                "baseline_style_distance": sum(baseline_distances) / len(baseline_distances) if baseline_distances else 0,
+            },
+            "passed": passed,
+        }
+        store.save_persona_evaluation(target, result)
+        print(
+            f"评测完成：候选 {counts['candidate']}，基线 {counts['baseline']}，"
+            f"相同 {counts['tie']}，都不像 {counts['neither']}，候选胜率 {preference:.1%}。"
+        )
+        print("结果：通过，可以激活。" if passed else "结果：未通过；可继续积累样本或修订画像。")
+        return 0 if passed else 1
+    finally:
+        store.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="QQ 机器人结构化人格采集和版本工具")
     parser.add_argument(
@@ -679,6 +961,8 @@ def build_parser() -> argparse.ArgumentParser:
     listing.set_defaults(handler=list_command)
     activate = subparsers.add_parser("activate", help="激活盲测通过的版本")
     activate.add_argument("version", type=int)
+    activate.add_argument("--force", action="store_true", help="应急跳过评测门禁")
+    activate.add_argument("--reason", default="", help="强制激活原因，使用 --force 时必填")
     activate.set_defaults(handler=activate_command)
     rollback = subparsers.add_parser("rollback", help="回退到上一个版本")
     rollback.set_defaults(handler=rollback_command)
@@ -689,6 +973,12 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("version", type=int)
     compare.add_argument("--output-dir", default="data")
     compare.set_defaults(handler=compare_command)
+    evaluate = subparsers.add_parser("evaluate", help="用画像截止后的临时 QQ 样本做留出评测")
+    evaluate.add_argument("version", type=int)
+    evaluate.add_argument("--ws-url", default="ws://127.0.0.1:3002")
+    evaluate.add_argument("--samples", type=int, default=30)
+    evaluate.add_argument("--min-samples", type=int, default=10)
+    evaluate.set_defaults(handler=evaluate_command)
     return parser
 
 
@@ -702,6 +992,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--limit 必须在 1 到 100000 之间")
     if not 0 <= getattr(args, "group_weight", 0.7) <= 1:
         parser.error("--group-weight 必须在 0 到 1 之间")
+    if not 10 <= getattr(args, "samples", 30) <= 100:
+        parser.error("--samples 必须在 10 到 100 之间")
+    if not 10 <= getattr(args, "min_samples", 10) <= getattr(args, "samples", 30):
+        parser.error("--min-samples 必须在 10 到 --samples 之间")
+    if getattr(args, "force", False) and not str(getattr(args, "reason", "")).strip():
+        parser.error("--force 必须同时提供非空 --reason")
     try:
         result = args.handler(args)
         return asyncio.run(result) if asyncio.iscoroutine(result) else int(result)

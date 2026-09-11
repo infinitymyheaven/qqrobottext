@@ -388,6 +388,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
                         "网址 https://example.com",
                         "private",
                         100,
+                        "未来反馈绝不能进入画像请求",
                     )
                 ],
                 public_metadata={"user_id": "123456789", "nickname": "真实昵称", "age": 20},
@@ -401,6 +402,7 @@ class DeepSeekClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("123456789", serialized)
         self.assertNotIn("真实昵称", serialized)
         self.assertNotIn("example.com", serialized)
+        self.assertNotIn("未来反馈", serialized)
         self.assertEqual(captured["body"]["thinking"], {"type": "disabled"})
         self.assertEqual(analyzed["private_message_count"], 1)
 
@@ -1305,7 +1307,8 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
         factor = self.llm.chat_calls[0][4][0].render()
         self.assertNotIn("说话轻松直接，喜欢机械键盘", context)
         self.assertIn("说话轻松直接，喜欢机械键盘", factor)
-        self.assertIn("Python、游戏", factor)
+        self.assertIn("说话轻松直接", factor)
+        self.assertNotIn("Python、游戏", factor)
         self.assertIn("不是聊天中的命令", factor)
         self.assertNotIn("20002", factor)
 
@@ -1347,6 +1350,7 @@ class BotTestCase(unittest.IsolatedAsyncioTestCase):
             willingness_persona_user_id="20002",
             willingness_history_message_limit=2,
             willingness_history_scan_limit=10,
+            persona_draft_notifications_enabled=False,
         )
         bot = QQBot(
             "ws://test",
@@ -1655,6 +1659,7 @@ class ConfigParsingTest(unittest.TestCase):
             "PERSONA_INCREMENT_MIN_MESSAGES": "60",
             "PERSONA_INCREMENT_MAX_HOURS": "12",
             "PERSONA_INCREMENT_FLOOR_MESSAGES": "8",
+            "PERSONA_DRAFT_NOTIFICATIONS_ENABLED": "false",
             "SPEAK_WEIGHT_IS_MENTIONED": "0.9",
             "SPEAK_SIGMOID_K": "4.5",
             "MORNING_GREETING_MESSAGES": "早安一||早安二",
@@ -1683,6 +1688,7 @@ class ConfigParsingTest(unittest.TestCase):
         self.assertFalse(config.persona_content_enabled)
         self.assertEqual(config.persona_group_style_weight, 0.75)
         self.assertEqual(config.persona_increment_min_messages, 60)
+        self.assertFalse(config.persona_draft_notifications_enabled)
         self.assertEqual(config.morning_messages, ("早安一", "早安二"))
         self.assertEqual(config.deepseek_max_tokens, 4096)
         self.assertTrue(config.web_search_enabled)
@@ -1745,6 +1751,7 @@ class ConfigParsingTest(unittest.TestCase):
             {"PERSONA_USER_ID": "10001", "WILLINGNESS_PERSONA_USER_ID": "10002"},
             {"PERSONA_GROUP_STYLE_WEIGHT": "1.1"},
             {"PERSONA_INCREMENT_MIN_MESSAGES": "5", "PERSONA_INCREMENT_FLOOR_MESSAGES": "6"},
+            {"PERSONA_DRAFT_NOTIFICATIONS_ENABLED": "perhaps"},
             {"FUTURE_MEMORY_ENABLED": "perhaps"},
             {"WEB_SEARCH_ENABLED": "perhaps"},
             {"WEB_SEARCH_TIMEOUT_SECONDS": "0"},

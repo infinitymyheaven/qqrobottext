@@ -7,8 +7,10 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.memory import MemoryStore
+from src.bot import OneBotActionError
 from src.persona import (
     PersonaContentEngine,
     PersonaSample,
@@ -19,6 +21,8 @@ from src.persona import (
 )
 from src.persona_collector import (
     Conversation,
+    _evaluation_passes,
+    _evaluation_samples,
     build_persona_samples,
     collect_conversation,
     parse_selection,
@@ -76,6 +80,120 @@ class PersonaPrivacyTest(unittest.TestCase):
         normalized = normalize_persona_analysis(profile(score=4.0))
         self.assertEqual(normalized["dimensions"][0]["score"], 1.0)
         self.assertEqual([item["text"] for item in normalized["phrases"]], ["确实"])
+
+    def test_normalization_controls_enums_and_derives_non_text_metadata(self):
+        value = profile()
+        value["exemplars"] = [
+            {
+                "situation": "考试没发挥好",
+                "response": "没事，下次再来？",
+                "scene": "group",
+                "intent": "invalid",
+                "emotion": "invalid",
+                "keywords": [*(f"词{index}" for index in range(10))],
+                "confidence": 2,
+                "evidence_count": 3,
+                "quality_score": -1,
+                "unknown": "不能进入结构",
+            }
+        ]
+        exemplar = normalize_persona_analysis(value)["exemplars"][0]
+        self.assertEqual(exemplar["intent"], "other")
+        self.assertEqual(exemplar["emotion"], "neutral")
+        self.assertEqual(len(exemplar["keywords"]), 8)
+        self.assertEqual(exemplar["confidence"], 1.0)
+        self.assertEqual(exemplar["quality_score"], 0.0)
+        self.assertEqual(exemplar["response_length"], len("没事，下次再来？"))
+        self.assertEqual(exemplar["punctuation"]["question"], 1)
+        self.assertNotIn("unknown", exemplar)
+
+    def test_context_retrieval_is_relevant_bounded_diverse_and_deterministic(self):
+        value = profile()
+        value["interests"] = ["考试复习", "电子游戏"]
+        value["dimensions"] = [
+            {
+                "name": name,
+                "scene": "group",
+                "score": index / 10,
+                "description": f"维度{index}",
+                "confidence": 1 - index / 100,
+                "evidence_count": 5,
+            }
+            for index, name in enumerate(
+                [
+                    "tone",
+                    "sentence_length",
+                    "punctuation_emoji",
+                    "vocabulary",
+                    "humor",
+                    "directness",
+                    "emotion",
+                    "questioning",
+                    "disagreement",
+                    "interaction_rhythm",
+                ]
+            )
+        ]
+        value["phrases"] = [
+            {
+                "text": f"考试短语{index}",
+                "scene": "group",
+                "frequency": 10 - index,
+                "confidence": 0.9,
+                "intent": "comfort",
+                "keywords": ["考试", "难过"],
+            }
+            for index in range(6)
+        ] + [
+            {
+                "text": "开黑走起",
+                "scene": "group",
+                "frequency": 99,
+                "confidence": 1,
+                "intent": "joke",
+                "keywords": ["游戏"],
+            }
+        ]
+        value["exemplars"] = [
+            {
+                "situation": f"考试失利后的安慰场景{index}",
+                "response": f"先缓缓，下一次再来{index}",
+                "scene": "group",
+                "intent": "comfort",
+                "emotion": "caring",
+                "keywords": ["考试", "失利"],
+                "confidence": 0.9,
+                "quality_score": 0.8,
+                "source_at": 100 + index,
+            }
+            for index in range(6)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "memory.sqlite3")
+            try:
+                store.save_persona_version("u", value, 200, activate=True)
+                engine = PersonaContentEngine(store, "u", "")
+                first = engine.build_factor(
+                    query="这次考试没考好，有点难过",
+                    history=[{"role": "user", "content": "刚出成绩"}],
+                ).guidance
+                second = engine.build_factor(
+                    query="这次考试没考好，有点难过",
+                    history=[{"role": "user", "content": "刚出成绩"}],
+                ).guidance
+                self.assertEqual(first, second)
+                self.assertIn("考试复习", first)
+                self.assertNotIn("电子游戏", first)
+                self.assertNotIn("开黑走起", first)
+                self.assertLessEqual(first.count("当前强度"), 6)
+                self.assertLessEqual(first.count("考试短语"), 4)
+                self.assertLessEqual(first.count("- 场景："), 4)
+
+                fallback = engine.build_factor(query="量子纠缠实验参数").guidance
+                self.assertIn("总体性格与表达倾向", fallback)
+                self.assertNotIn("脱敏风格样例", fallback)
+            finally:
+                store.close()
 
     def test_group_private_merge_uses_configured_scene_weight(self):
         grouped = profile(scene="group", score=1.0, evidence=10, summary="群聊总结")
@@ -146,6 +264,71 @@ class PersonaStoreTest(unittest.TestCase):
         self.assertEqual(online["summary"], "安全后备")
         self.assertEqual(online["active_version"], 0)
         self.assertEqual(draft["summary"], "尚未批准的人格")
+        self.assertEqual(
+            self.store.conn.execute(
+                "SELECT last_source_message_at FROM willingness_personas WHERE user_id='u'"
+            ).fetchone()[0],
+            20,
+        )
+
+    def test_evaluation_gate_and_forced_activation_are_aggregate_only(self):
+        self.store.save_persona_version("u", profile(summary="第一版"), 100, activate=True)
+        candidate = self.store.save_persona_version("u", profile(summary="第二版"), 200)
+        with self.assertRaisesRegex(ValueError, "尚未通过"):
+            self.store.activate_persona_version(
+                "u", candidate, require_passed_evaluation=True
+            )
+        self.store.save_persona_evaluation(
+            "u",
+            {
+                "version": candidate,
+                "baseline_version": 1,
+                "evaluated_at": 300,
+                "sample_count": 10,
+                "candidate_wins": 6,
+                "baseline_wins": 4,
+                "ties": 0,
+                "neither_count": 0,
+                "candidate_preference_rate": 0.6,
+                "safety_failures": 0,
+                "metrics": {
+                    "candidate_style_distance": 0.2,
+                    "baseline_style_distance": 0.3,
+                    "raw_context": "绝不应保存的聊天正文",
+                },
+                "passed": True,
+            },
+        )
+        self.store.activate_persona_version(
+            "u", candidate, require_passed_evaluation=True, activated_at=400
+        )
+        stored = self.store.conn.execute(
+            "SELECT metrics_json FROM persona_evaluations"
+        ).fetchone()[0]
+        self.assertNotIn("聊天正文", stored)
+        self.assertEqual(self.store.get_persona_profile("u", "")["summary"], "第二版")
+
+        third = self.store.save_persona_version("u", profile(summary="应急版"), 500)
+        with self.assertRaisesRegex(ValueError, "非空原因"):
+            self.store.activate_persona_version("u", third, force=True)
+        self.store.activate_persona_version(
+            "u",
+            third,
+            require_passed_evaluation=True,
+            force=True,
+            reason="线上紧急修复",
+            activated_at=600,
+        )
+        event = self.store.conn.execute(
+            "SELECT version, reason FROM persona_activation_events "
+            "ORDER BY event_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(event), (third, "线上紧急修复"))
+        evaluation_columns = {
+            row["name"]
+            for row in self.store.conn.execute("PRAGMA table_info(persona_evaluations)")
+        }
+        self.assertNotIn("user_id", evaluation_columns)
 
     def test_collection_checkpoint_only_contains_derived_json(self):
         self.store.save_persona_collection_state(
@@ -194,6 +377,50 @@ class PersonaStoreTest(unittest.TestCase):
         self.assertIn("active_version", columns)
         self.assertEqual(self.store.get_persona_profile("u", "")["summary"], "旧摘要")
 
+    def test_old_structured_persona_tables_gain_metadata_without_rebuild(self):
+        self.store.close()
+        self.path.unlink()
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """CREATE TABLE persona_phrases (
+                user_id TEXT, version INTEGER, phrase TEXT, scene TEXT,
+                frequency INTEGER, confidence REAL,
+                PRIMARY KEY (user_id, version, phrase, scene))"""
+        )
+        connection.execute(
+            "INSERT INTO persona_phrases VALUES ('u', 1, '确实', 'group', 3, 0.8)"
+        )
+        connection.execute(
+            """CREATE TABLE persona_exemplars (
+                user_id TEXT, version INTEGER, exemplar_order INTEGER,
+                scene TEXT, situation TEXT, response TEXT,
+                PRIMARY KEY (user_id, version, exemplar_order))"""
+        )
+        connection.execute(
+            "INSERT INTO persona_exemplars VALUES ('u', 1, 0, 'group', '场景', '回复')"
+        )
+        connection.commit()
+        connection.close()
+        self.store = MemoryStore(self.path)
+        phrase_columns = {
+            row["name"]
+            for row in self.store.conn.execute("PRAGMA table_info(persona_phrases)")
+        }
+        exemplar_columns = {
+            row["name"]
+            for row in self.store.conn.execute("PRAGMA table_info(persona_exemplars)")
+        }
+        self.assertTrue({"intent", "keywords_json"}.issubset(phrase_columns))
+        self.assertTrue(
+            {"intent", "emotion", "quality_score", "punctuation_json"}.issubset(
+                exemplar_columns
+            )
+        )
+        self.assertEqual(
+            self.store.conn.execute("SELECT phrase FROM persona_phrases").fetchone()[0],
+            "确实",
+        )
+
 
 class PersonaCollectorTest(unittest.IsolatedAsyncioTestCase):
     def test_selection_parser(self):
@@ -201,6 +428,95 @@ class PersonaCollectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parse_selection("all", 3), [0, 1, 2])
         with self.assertRaises(ValueError):
             parse_selection("5", 4)
+
+    def test_evaluation_threshold_requires_ten_decisive_and_zero_safety_failures(self):
+        self.assertEqual(
+            _evaluation_passes(
+                sample_count=10,
+                candidate_wins=6,
+                baseline_wins=4,
+                safety_failures=0,
+                min_samples=10,
+            ),
+            (True, 0.6),
+        )
+        self.assertFalse(
+            _evaluation_passes(
+                sample_count=10,
+                candidate_wins=5,
+                baseline_wins=4,
+                safety_failures=0,
+                min_samples=10,
+            )[0]
+        )
+        self.assertFalse(
+            _evaluation_passes(
+                sample_count=10,
+                candidate_wins=6,
+                baseline_wins=4,
+                safety_failures=1,
+                min_samples=10,
+            )[0]
+        )
+
+    async def test_evaluation_samples_strictly_exclude_training_period(self):
+        page = {
+            "messages": [
+                {
+                    "message_id": str(index),
+                    "message_seq": str(index),
+                    "time": timestamp,
+                    "user_id": "target",
+                    "message": [{"type": "text", "data": {"text": f"回复{index}"}}],
+                }
+                for index, timestamp in enumerate((99, 100, 101, 102), 1)
+            ]
+        }
+
+        class RPC:
+            async def request(_self, _action, _params):
+                return page
+
+        samples = await _evaluation_samples(
+            RPC(),
+            [Conversation("group:g", "group", "g", "测试")],
+            "target",
+            source_ended_at=100,
+            limit=30,
+        )
+        self.assertEqual([item.sent_at for item in samples], [101, 102])
+
+    async def test_evaluation_skips_one_napcat_conversation_with_empty_local_history(self):
+        page = {
+            "messages": [
+                {
+                    "message_id": "new",
+                    "message_seq": "1",
+                    "time": 101,
+                    "user_id": "target",
+                    "message": [{"type": "text", "data": {"text": "有效回复"}}],
+                }
+            ]
+        }
+
+        class RPC:
+            async def request(_self, _action, params):
+                if params.get("group_id") == "empty":
+                    raise OneBotActionError(1200, "消息 undefined 不存在")
+                return page
+
+        with patch("sys.stderr"):
+            samples = await _evaluation_samples(
+                RPC(),
+                [
+                    Conversation("group:empty", "group", "empty", "空会话"),
+                    Conversation("group:ok", "group", "ok", "有效会话"),
+                ],
+                "target",
+                source_ended_at=100,
+                limit=30,
+            )
+        self.assertEqual([item.response for item in samples], ["有效回复"])
 
     def test_context_builder_anonymizes_names_and_keeps_limited_context(self):
         messages = [
@@ -216,7 +532,8 @@ class PersonaCollectorTest(unittest.IsolatedAsyncioTestCase):
         samples = build_persona_samples(messages, "target", "group", before=2, after=1)
         self.assertEqual(len(samples), 1)
         self.assertIn("内容2", samples[0].context)
-        self.assertIn("内容5", samples[0].context)
+        self.assertNotIn("内容5", samples[0].context)
+        self.assertIn("内容5", samples[0].outcome)
         self.assertNotIn("内容1", samples[0].context)
         self.assertNotIn("姓名", samples[0].context)
 
@@ -279,6 +596,94 @@ class PersonaCollectorTest(unittest.IsolatedAsyncioTestCase):
                 persisted = persisted[2]
                 self.assertNotIn("13800138000", persisted)
                 self.assertNotIn("真实朋友", persisted)
+            finally:
+                store.close()
+
+    def test_merge_uses_time_decay_and_keeps_best_near_duplicate_representative(self):
+        old = profile(score=0.0, summary="旧")
+        old["source_ended_at"] = 20
+        old["exemplars"][0].update(
+            {"confidence": 0.2, "quality_score": 0.2, "evidence_count": 1}
+        )
+        recent = profile(score=1.0, summary="新")
+        recent["source_ended_at"] = 20 + 180 * 86400
+        recent["phrases"][0]["text"] = "确实！"
+        recent["exemplars"][0].update(
+            {
+                "response": "这确实有点意思！",
+                "confidence": 0.9,
+                "quality_score": 0.9,
+                "evidence_count": 8,
+            }
+        )
+        merged = merge_persona_profiles([old, recent])
+        self.assertGreater(merged["dimensions"][0]["score"], 0.6)
+        self.assertEqual(len(merged["phrases"]), 1)
+        self.assertEqual(merged["phrases"][0]["frequency"], 6)
+        self.assertEqual(len(merged["exemplars"]), 1)
+        self.assertEqual(merged["exemplars"][0]["response"], "这确实有点意思！")
+
+    async def test_collection_carries_three_older_messages_across_page_boundary(self):
+        newer = {
+            "messages": [
+                {
+                    "message_id": "target",
+                    "message_seq": "100",
+                    "time": 100,
+                    "user_id": "target",
+                    "message": [{"type": "text", "data": {"text": "接上这句话"}}],
+                }
+            ]
+        }
+        older = {
+            "messages": [
+                {
+                    "message_id": f"old-{index}",
+                    "message_seq": str(100 - index),
+                    "time": 100 - index,
+                    "user_id": f"u{index}",
+                    "message": [{"type": "text", "data": {"text": f"前文{index}"}}],
+                }
+                for index in range(1, 5)
+            ]
+        }
+
+        class RPC:
+            def __init__(_self):
+                _self.calls = 0
+
+            async def request(_self, _action, _params):
+                _self.calls += 1
+                return newer if _self.calls == 1 else older if _self.calls == 2 else {"messages": []}
+
+        contexts = []
+
+        class LLM:
+            async def analyze_persona_samples(_self, samples, **_kwargs):
+                contexts.extend(item.context for item in samples)
+                return profile(evidence=len(samples))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = MemoryStore(Path(directory) / "memory.sqlite3")
+            try:
+                result, _report = await collect_conversation(
+                    RPC(),
+                    LLM(),
+                    store,
+                    Conversation("group:g", "group", "g", "测试"),
+                    "target",
+                    cutoff=0,
+                    remaining=20,
+                    seed_background="后备",
+                    public_metadata={},
+                    restart=True,
+                )
+                self.assertEqual(result["source_message_count"], 1)
+                self.assertEqual(len(contexts), 1)
+                self.assertNotIn("前文4", contexts[0])
+                self.assertIn("前文3", contexts[0])
+                self.assertIn("前文2", contexts[0])
+                self.assertIn("前文1", contexts[0])
             finally:
                 store.close()
 

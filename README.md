@@ -113,29 +113,35 @@ FUTURE_MEMORY_SOURCE=active_window_all
 
 常驻机器人只能持续看到双方共同白名单群里的模板账号新发言。如需使用更丰富的历史，在另一个 NapCat 实例中由账号本人扫码登录，并把正向 WebSocket 端口设为 `3002`。不要把 QQ 密码发给程序、AI 或写入 `.env`。
 
-采集器连接后先核对登录账号，再在本机终端列出群聊和好友供你选择。默认尽力扫描最近 90 天、最多 20000 条模板账号文字，并为每条本人发言保留此前最多三条、此后一条脱敏上下文。完整原文只存在于当前内存批次；DeepSeek 只收到去标识文本，不使用 `web_search`，SQLite 只保存结构化特征、短脱敏样例和断点统计。
+采集器连接后先核对登录账号，再在本机终端列出群聊和好友供你选择。默认尽力扫描最近 90 天、最多 20000 条模板账号文字，并为每条本人发言保留此前最多三条脱敏语境；回复后的第一条消息只作为内存中的效果参考，不作为回复生成条件。跨历史分页的三条边界语境也会补齐。完整原文只存在于当前内存批次；DeepSeek 只收到去标识文本，不使用 `web_search`，SQLite 只保存结构化特征、短脱敏样例和断点统计。
 
 ```powershell
 # 生成草稿；Token 会在终端中隐藏输入。
 .venv\Scripts\python.exe src\persona_collector.py collect
 
-# 查看版本并生成 20 组新旧回复盲测。
+# 查看版本；compare 可生成补充性的 20 组通用场景盲测。
 .venv\Scripts\python.exe src\persona_collector.py list
 .venv\Scripts\python.exe src\persona_collector.py compare 2
 
-# 盲测确认后激活；也可回退或彻底删除派生数据。
+# 使用画像截止时间之后的真实消息做 10–30 条留出 A/B 评测。
+.venv\Scripts\python.exe src\persona_collector.py evaluate 2
+
+# 评测通过后才能普通激活；也可回退或彻底删除派生数据。
 .venv\Scripts\python.exe src\persona_collector.py activate 2
+.venv\Scripts\python.exe src\persona_collector.py activate 2 --force --reason "应急原因"
 .venv\Scripts\python.exe src\persona_collector.py rollback
 .venv\Scripts\python.exe src\persona_collector.py delete
 ```
 
-采集器生成的版本默认是 `draft`，不会影响线上机器人。激活或回退后重启机器人生效。NapCat 历史受本机缓存和版本差异影响，命令会报告实际覆盖范围及重复页、离线缺口等情况；`--restart` 可忽略旧断点重新采集。
+采集器和常驻机器人的增量提炼都只生成 `draft`，不会自动改变线上人格。草稿生成后，Windows 通知只显示版本号和新增样本数；点击会打开可见 PowerShell 进入 Token 隐藏输入和会话选择，通知不可用时终端会打印同一条评测命令。留出评测只接受严格晚于候选画像截止时间的模板用户消息，并且只把四类人工选择计数、胜率、聚合风格距离和安全失败数写入 SQLite。至少完成 10 条、候选/基线明确选择不少于 10 条、候选胜率达到 55% 且安全失败为零才通过。`activate` 默认执行该门禁；`--force --reason` 只供应急使用并记录原因，`rollback` 不受门禁限制。激活或回退后重启机器人生效。
+
+线上回答只读取已激活版本，但下一轮增量会以最新草稿为合并基线。当前问题与最近三轮安全对话只在本地参与人格样例、维度、短语和兴趣检索：相关样例经 MMR 去重后最多注入 4 个，场景维度最多 6 个，匹配短语最多 4 个且单次最多使用一个；低置信度时不会强塞无关样例。NapCat 历史受本机缓存和版本差异影响，命令会报告实际覆盖范围及重复页、离线缺口等情况；`--restart` 可忽略旧断点重新采集。
 
 人格与话题提炼使用 DeepSeek JSON Output，并显式关闭思考模式，把输出额度留给最终结构化结果。若接口偶发返回空内容或 JSON 被截断，程序会自动重试三次并逐次增加输出额度；日志只记录完成原因和是否出现思考内容，不记录聊天证据或模型原文。
 
 ## 安装
 
-环境要求：Python 3.10+、NapCat、DeepSeek API Key。项目依赖 `websockets` 和 Windows 所需的 IANA 时区数据 `tzdata`。
+环境要求：Python 3.10+、NapCat、DeepSeek API Key。项目依赖 `websockets`、Windows Toast 所需的 `winotify` 和 IANA 时区数据 `tzdata`。
 
 ```powershell
 python -m venv .venv
@@ -210,6 +216,7 @@ DeepSeek V4 偶发会把内部 DSML 工具标记误放进回答正文。机器�
 | `PERSONA_CONTENT_ENABLED` / `PERSONA_GROUP_STYLE_WEIGHT` | `true` / `0.70` | 是否向 AI 注入人格内容因子，以及群聊相对私聊的风格权重 |
 | `PERSONA_INCREMENT_MIN_MESSAGES` | `50` | 共同白名单群内累计到多少条模板发言后立即更新人格 |
 | `PERSONA_INCREMENT_MAX_HOURS` / `PERSONA_INCREMENT_FLOOR_MESSAGES` | `24` / `10` | 未达到立即更新阈值时的最长等待时间和最少消息数 |
+| `PERSONA_DRAFT_NOTIFICATIONS_ENABLED` | `true` | 草稿生成后是否显示可点击的 Windows 留出评测通知；失败时打印后备命令 |
 | `WILLINGNESS_HISTORY_DAYS` | `30` | 首次个人背景历史时间范围 |
 | `WILLINGNESS_HISTORY_MESSAGE_LIMIT` / `WILLINGNESS_HISTORY_SCAN_LIMIT` | `2000` / `10000` | 最多收集的本人消息数和最多扫描的源消息数 |
 | `WILLINGNESS_BOND_INBOUND_RATE` / `WILLINGNESS_BOND_OUTBOUND_RATE` | `0.12` / `0.08` | 群友与机器人双向互动时关系向 1 靠近的比例 |
